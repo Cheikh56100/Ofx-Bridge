@@ -2,7 +2,5 @@ streamlit>=1.32.0
 pdfplumber>=0.10.3
 pydantic>=2.0.0
 pandas>=2.0.0
-
-Optionnel — OCR pour PDFs scannés (décommenter si Tesseract est installé sur le serveur)
 pytesseract>=0.3.10
 pdf2image>=1.17.0
