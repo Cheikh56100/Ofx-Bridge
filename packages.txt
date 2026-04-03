@@ -1,0 +1,6 @@
+# Décommentez les lignes ci-dessous UNIQUEMENT si vous activez l'OCR
+# (pytesseract + pdf2image dans requirements.txt)
+#
+# tesseract-ocr
+# tesseract-ocr-fra
+# poppler-utils
