@@ -1129,11 +1129,337 @@ def _universal_parse_path(pdf_path, pages_text):
                 if txn: txns.append(txn)
     return info, [t for t in txns if t is not None]
 
+# ════════════════════════════════════════════════════════════════════════════
+# PARSEURS AFRICAINS DÉDIÉS
+# ════════════════════════════════════════════════════════════════════════════
+
+def _afr_header(pages_text):
+    """Header commun pour les banques africaines."""
+    text = ' '.join(pages_text[:3])
+    info = {'iban': '', 'period_start': '', 'period_end': '',
+            'balance_open': 0.0, 'balance_close': 0.0}
+    # IBAN / compte SN
+    m = re.search(r'(?:IBAN|Code Iban|SN\d{2}SN[A-Z0-9]+)\s*:?\s*(SN\d{2}[A-Z0-9\s]{10,})', text, re.IGNORECASE)
+    if m:
+        info['iban'] = re.sub(r'\s+', '', m.group(1))[:34]
+    else:
+        m2 = re.search(r'(SN\d{2}SN[A-Z0-9]{20,})', text)
+        if m2:
+            info['iban'] = m2.group(1)[:34]
+    # Période
+    m3 = re.search(r'(?:du|[Pp]ériode du?|[Pp]our la p[ée]riode du?|[Dd]u)\s+'
+                   r'(\d{1,2}[/\-\.]\d{2}[/\-\.]\d{2,4})'
+                   r'\s*(?:au|[àa]|[Aa]u)\s*'
+                   r'(\d{1,2}[/\-\.]\d{2}[/\-\.]\d{2,4})',
+                   text, re.IGNORECASE)
+    if m3:
+        info['period_start'] = m3.group(1).replace('-', '/').replace('.', '/')
+        info['period_end']   = m3.group(2).replace('-', '/').replace('.', '/')
+    return info
+
+
+# ── BSIC : format « Date Valeur | Libellé | Débit | Crédit | Solde »
+# Le PDF BSIC a des colonnes bien définies par position x
+def parse_bsic(pages_words, pages_text, _pdf_path=''):
+    info = _afr_header(pages_text)
+    year = _year_from_text(' '.join(pages_text[:2]))
+    txns = []
+    SKIP = {'TOTAL','SOLDE','A REPORTER','REPORT','DATE','VALEUR','LIBELLÉ','LIBELLE',
+            'DÉBIT','DEBIT','CRÉDIT','CREDIT','EXTRAIT','PÉRIODE','CODE','NOM'}
+
+    for pw in pages_words:
+        rows = group_words_by_row(pw, tol=4.0)
+        for row in rows:
+            # Date : dd/mm/yyyy en x0 < 80
+            date_w = [w for w in row if w['x0'] < 80
+                      and re.match(r'^\d{2}/\d{2}/\d{4}$', w['text'])]
+            if not date_w:
+                continue
+            date_str = date_w[0]['text']
+
+            # Libellé : entre x0 ~80 et ~310
+            label_words = [w for w in row if 70 <= w['x0'] < 320]
+            label = ' '.join(w['text'] for w in label_words).strip()
+            if not label or any(s in label.upper() for s in SKIP):
+                continue
+
+            # Débit (x0 320-430) / Crédit (x0 430-530)
+            debit_words  = [w for w in row if 310 <= w['x0'] < 440]
+            credit_words = [w for w in row if 430 <= w['x0'] < 550]
+
+            debit_amt  = _parse_col_amount(debit_words)
+            credit_amt = _parse_col_amount(credit_words)
+
+            date_ofx = date_full_to_ofx(date_str)
+            name, memo = smart_label(label, [])
+            if debit_amt and debit_amt > 0:
+                txns.append(_make_txn(date_ofx, -debit_amt, name, memo))
+            elif credit_amt and credit_amt > 0:
+                txns.append(_make_txn(date_ofx, credit_amt, name, memo))
+
+    # Fallback universel si rien trouvé
+    if not txns and _pdf_path and Path(_pdf_path).exists():
+        return _universal_parse_path(_pdf_path, pages_text)
+    return info, [t for t in txns if t is not None]
+
+
+# ── BIS (Banque Islamique du Sénégal) : format iMAL*CSM
+# Colonnes : Date trs | Dte valeur | No Trs | Description | Mnt Cr | Mnt Débit | Solde
+def parse_bis(pages_words, pages_text, _pdf_path=''):
+    info = _afr_header(pages_text)
+    year = _year_from_text(' '.join(pages_text[:2]))
+    txns = []
+    SKIP = {'TOTAL','SOLDE','DATE','VALEUR','NO TRS','DESCRIPTION','MNT','CR','DÉBIT',
+            'RÉSUMÉ','BANQUE','ISLAMIQUE','ECOLE','CIF','NO. CPTE','DISPONIBLE'}
+
+    for pw in pages_words:
+        rows = group_words_by_row(pw, tol=5.0)
+        for row in rows:
+            # Date transaction : dd/mm/yyyy en x0 < 75
+            date_w = [w for w in row if w['x0'] < 75
+                      and re.match(r'^\d{2}/\d{2}/\d{4}$', w['text'])]
+            if not date_w:
+                continue
+            date_str = date_w[0]['text']
+
+            # Description : x0 ~150-380
+            desc_words = [w for w in row if 140 <= w['x0'] < 390]
+            label = ' '.join(w['text'] for w in desc_words).strip()
+            if not label or any(s in label.upper() for s in SKIP):
+                continue
+            # Ignorer les lignes purement techniques (No de chèque seul)
+            if re.match(r'^[0-9]{7,}$', label.replace(' ', '')):
+                continue
+
+            # Crédit (Mnt Cr) ~ x0 390-490
+            credit_words = [w for w in row if 380 <= w['x0'] < 500]
+            # Débit (Mnt débit) ~ x0 490-590
+            debit_words  = [w for w in row if 480 <= w['x0'] < 620]
+
+            credit_amt = _parse_col_amount(credit_words)
+            debit_amt  = _parse_col_amount(debit_words)
+
+            date_ofx = date_full_to_ofx(date_str)
+            name, memo = smart_label(label, [])
+            if credit_amt and credit_amt > 0:
+                txns.append(_make_txn(date_ofx, credit_amt, name, memo))
+            elif debit_amt and debit_amt > 0:
+                txns.append(_make_txn(date_ofx, -debit_amt, name, memo))
+
+    if not txns and _pdf_path and Path(_pdf_path).exists():
+        return _universal_parse_path(_pdf_path, pages_text)
+    return info, [t for t in txns if t is not None]
+
+
+# ── BNDE : format tableau Date | Libellé | Valeur | Débit | Crédit | Solde
+# PDF scanned/image → on utilise le texte extrait ligne par ligne
+def parse_bnde(pages_words, pages_text, _pdf_path=''):
+    info = _afr_header(pages_text)
+    # Essai d'abord avec pdfplumber table
+    if _pdf_path and Path(_pdf_path).exists():
+        result_info, txns = _universal_parse_path(_pdf_path, pages_text)
+        if txns:
+            result_info.update({k: v for k, v in info.items() if v})
+            return result_info, txns
+
+    # Fallback : parsing texte brut
+    year = _year_from_text(' '.join(pages_text[:2]))
+    txns = []
+    SKIP = {'TOTAL','SOLDE','DATE','LIBELLÉ','LIBELLE','VALEUR','DÉBIT','DEBIT',
+            'CRÉDIT','CREDIT','A REPORTER','SOLDE À REPORTER','TITULAIRE','RELEVE',
+            'VEUILLEZ','PAGE','BNDE','AGENCE','COMPTE','DEVISE','DOMICILIATION',
+            'SIÈGE','SOCIAL','RCCM','NINEA'}
+
+    full_text = '\n'.join(pages_text)
+    lines = full_text.splitlines()
+
+    # Pattern : ligne avec date DD/MM en colonne gauche
+    date_re = re.compile(r'^(\d{2}/\d{2})\s+(.+)')
+    amount_re = re.compile(r'([\d\s]+[\.,]\d{3}(?:[\.,]\d{3})*|[\d\s]+)')
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        m = date_re.match(line)
+        if not m:
+            continue
+        day_month = m.group(1)  # DD/MM
+        rest = m.group(2).strip()
+
+        # Ignorer les lignes d'en-tête ou de solde
+        rest_up = rest.upper()
+        if any(s in rest_up for s in SKIP):
+            continue
+
+        # Chercher les montants dans le reste de la ligne
+        # Format typique : LIBELLÉ   [VALEUR]   DÉBIT   CRÉDIT   SOLDE
+        amounts = re.findall(r'[\d\s]{1,15}[\.,]\d{3}(?:[\.,]\d{3})*|[\d]+[\.,]\d{2}', rest)
+        amounts_parsed = []
+        for a in amounts:
+            v = parse_amount(a.strip())
+            if v is not None and v > 0:
+                amounts_parsed.append(v)
+
+        if not amounts_parsed:
+            continue
+
+        # Le libellé est le texte avant les chiffres
+        label_match = re.match(r'^([A-Za-zÀ-ÿ\s\-\'\./,&:°N°]+)', rest)
+        label = label_match.group(1).strip() if label_match else rest[:50].strip()
+        if not label or len(label) < 3:
+            continue
+        if any(s in label.upper() for s in SKIP):
+            continue
+
+        date_ofx = f"{year}{day_month[3:5]}{day_month[0:2]}"
+        name, memo = smart_label(label, [])
+
+        # Heuristique: si 2 montants ou plus, le premier non-nul = débit ou crédit
+        # On n'a pas la position x donc on utilise le contexte
+        # Pour BNDE on essaie la colonne valeur (1er) puis débit (2e) puis crédit (3e)
+        if len(amounts_parsed) >= 2:
+            # Si le libellé contient des mots associés à un crédit
+            credit_kw = {'VERSEMENT','VIREMENT','RECU','REMISE','CREDIT','DÉBLOCAGE',
+                         'DEBLOCAGE','ANNUL CHQ','RECOUVREMENT','SWIFT'}
+            debit_kw  = {'RETRAIT','CHEQ','CHQ','AGIOS','FRAIS','COMMISSION','APPEL',
+                         'ABONNEMENT','ROUTAGE','VIREMENT AUTRE','RETRAIT ESP'}
+            is_credit = any(k in label.upper() for k in credit_kw)
+            is_debit  = any(k in label.upper() for k in debit_kw)
+            amt = amounts_parsed[-1]  # dernier montant souvent débit/crédit
+            if is_credit and not is_debit:
+                txns.append(_make_txn(date_ofx, amt, name, memo))
+            elif is_debit and not is_credit:
+                txns.append(_make_txn(date_ofx, -amt, name, memo))
+            # else: ambigu, on skip
+        elif len(amounts_parsed) == 1:
+            # Seul montant : impossible de déterminer sens sans position x
+            pass
+
+    if not txns and _pdf_path and Path(_pdf_path).exists():
+        return _universal_parse_path(_pdf_path, pages_text)
+    return info, [t for t in txns if t is not None]
+
+
+# ── UBA : format Extrait de compte
+# Colonnes : Date | Instr. | Opération | Valeur | Débit | Crédit | Solde
+def parse_uba(pages_words, pages_text, _pdf_path=''):
+    info = _afr_header(pages_text)
+    year = _year_from_text(' '.join(pages_text[:2]))
+    txns = []
+    SKIP = {'TOTAL','SOLDE','DATE','VALEUR','INSTR','OPÉRATION','OPERATION',
+            'DÉBIT','DEBIT','CRÉDIT','CREDIT','UBA','UNITED','BANK','AFRICA',
+            'EXTRAIT','RELEVÉ','TITULAIRE','RIB','BIC','MERMOZ','ILEMEL'}
+
+    for pw in pages_words:
+        rows = group_words_by_row(pw, tol=5.0)
+        for row in rows:
+            # Date : dd/mm/yyyy en position x < 90
+            date_w = [w for w in row if w['x0'] < 90
+                      and re.match(r'^\d{2}/\d{2}/\d{4}$', w['text'])]
+            if not date_w:
+                continue
+            date_str = date_w[0]['text']
+
+            # Opération / libellé : x0 entre 80 et ~340
+            label_words = [w for w in row if 80 <= w['x0'] < 350]
+            label = ' '.join(w['text'] for w in label_words).strip()
+            if not label or any(s in label.upper() for s in SKIP):
+                continue
+
+            # Valeur (date valeur) x0 ~350-420
+            # Débit : x0 ~420-510
+            debit_words  = [w for w in row if 400 <= w['x0'] < 520]
+            # Crédit : x0 ~510-610
+            credit_words = [w for w in row if 500 <= w['x0'] < 650]
+
+            debit_amt  = _parse_col_amount(debit_words)
+            credit_amt = _parse_col_amount(credit_words)
+
+            # UBA utilise parfois format "41 295,00" avec espace comme séparateur milliers
+            if not debit_amt and not credit_amt:
+                # Tentative de lecture globale des montants sur la ligne
+                all_amounts = [w for w in row if w['x0'] >= 400
+                               and re.match(r'^\d[\d\s,\.]*$', w['text'])]
+                if all_amounts:
+                    full_str = ' '.join(w['text'] for w in all_amounts)
+                    val = parse_amount(full_str.strip())
+                    if val and val > 0:
+                        # Heuristique : "MAINLEVEE/MEMO BLOCAGE" = crédit, reste = débit
+                        if any(k in label.upper() for k in ('MAINLEVEE','BLOCAGE','RECU','SWIFT')):
+                            credit_amt = val
+                        else:
+                            debit_amt = val
+
+            date_ofx = date_full_to_ofx(date_str)
+            name, memo = smart_label(label, [])
+            if debit_amt and debit_amt > 0:
+                txns.append(_make_txn(date_ofx, -debit_amt, name, memo))
+            elif credit_amt and credit_amt > 0:
+                txns.append(_make_txn(date_ofx, credit_amt, name, memo))
+
+    if not txns and _pdf_path and Path(_pdf_path).exists():
+        return _universal_parse_path(_pdf_path, pages_text)
+    return info, [t for t in txns if t is not None]
+
+
+# ── SG Afrique : format identique à SG France mais avec IBAN SN / XOF
+def parse_sg_afrique(pages_words, pages_text, _pdf_path=''):
+    info = _afr_header(pages_text)
+    txns = []
+    SKIP = {'TOTAUX DES','NOUVEAU SOLDE','SOLDE PRECEDENT','PROGRAMME DE',
+            'RAPPEL DES','MONTANT CUMULE','SOLDE AU','DATE D','DATE DE','LIBELLÉ',
+            'TOTAL DES','DÉBIT','CRÉDIT'}
+
+    for pw in pages_words:
+        rows = group_words_by_row(pw, tol=4.0)
+        i = 0
+        while i < len(rows):
+            row = rows[i]
+            # Date : dd/mm/yyyy en x0 < 75
+            if not (row and row[0]['x0'] < 75
+                    and re.match(r'^\d{2}/\d{2}/\d{4}$', row[0]['text'])):
+                i += 1; continue
+
+            label = ' '.join(w['text'] for w in row if 100 <= w['x0'] < 430).strip()
+            if not label or any(s in label.upper() for s in SKIP):
+                i += 1; continue
+
+            # SG Afrique : Débit x0 430-520, Crédit x0 520-600
+            debit_amt  = _sg_amount_in_zone(row, 400, 520)
+            credit_amt = _sg_amount_in_zone(row, 510, 620)
+
+            # Mémo lignes suivantes
+            memo_parts = []
+            j = i + 1
+            while j < len(rows):
+                r2 = rows[j]
+                if r2 and r2[0]['x0'] < 75 and re.match(r'^\d{2}/\d{2}/\d{4}$', r2[0]['text']):
+                    break
+                nl = ' '.join(w['text'] for w in r2 if 100 <= w['x0'] < 430).strip()
+                if nl and not any(s in nl.upper() for s in SKIP):
+                    memo_parts.append(nl)
+                j += 1
+            i = j
+
+            date_ofx = date_full_to_ofx(row[0]['text'])
+            name, memo = smart_label(label, memo_parts)
+            if debit_amt and debit_amt > 0:
+                txns.append(_make_txn(date_ofx, -debit_amt, name, memo))
+            elif credit_amt and credit_amt > 0:
+                txns.append(_make_txn(date_ofx, credit_amt, name, memo))
+
+    if not txns and _pdf_path and Path(_pdf_path).exists():
+        return _universal_parse_path(_pdf_path, pages_text)
+    return info, [t for t in txns if t is not None]
+
+
+# ── Parseurs génériques pour les banques africaines moins fréquentes
 def _make_african_parser(bank_name):
     def _parser(pages_words, pages_text, _pdf_path=''):
         if _pdf_path and Path(_pdf_path).exists():
             return _universal_parse_path(_pdf_path, pages_text)
-        return _extract_universal_header(pages_text), []
+        return _afr_header(pages_text), []
     return _parser
 
 parse_cbao      = _make_african_parser('CBAO')
@@ -1142,32 +1468,12 @@ parse_coris     = _make_african_parser('Coris')
 parse_orabank   = _make_african_parser('Orabank')
 parse_boa       = _make_african_parser('BOA')
 parse_atb       = _make_african_parser('ATB')
-parse_bnde      = _make_african_parser('BNDE')
 parse_universal = _make_african_parser('Universal')
 
-# Parseurs africains dédiés simplifiés (utilisent le moteur universel via pdf_path)
 def parse_ecobank(pages_words, pages_text, _pdf_path=''):
     if _pdf_path and Path(_pdf_path).exists():
         return _universal_parse_path(_pdf_path, pages_text)
-    return _extract_universal_header(pages_text), []
-
-def parse_bsic(pages_words, pages_text, _pdf_path=''):
-    if _pdf_path and Path(_pdf_path).exists():
-        return _universal_parse_path(_pdf_path, pages_text)
-    return _extract_universal_header(pages_text), []
-
-def parse_bis(pages_words, pages_text, _pdf_path=''):
-    return _extract_universal_header(pages_text), []
-
-def parse_uba(pages_words, pages_text, _pdf_path=''):
-    if _pdf_path and Path(_pdf_path).exists():
-        return _universal_parse_path(_pdf_path, pages_text)
-    return _extract_universal_header(pages_text), []
-
-def parse_sg_afrique(pages_words, pages_text, _pdf_path=''):
-    if _pdf_path and Path(_pdf_path).exists():
-        return _universal_parse_path(_pdf_path, pages_text)
-    return _extract_universal_header(pages_text), []
+    return _afr_header(pages_text), []
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1333,252 +1639,626 @@ def fmt_amount(amount: float, currency: str) -> str:
 
 def main():
     st.set_page_config(
-        page_title="OFX Bridge",
+        page_title="OFX Bridge — PDF vers OFX",
         page_icon="💱",
         layout="wide",
         initial_sidebar_state="expanded",
     )
 
-    # ── CSS personnalisé ──────────────────────────────────────────────────────
+    # ── CSS Modern Blue & White ───────────────────────────────────────────────
     st.markdown("""
     <style>
-      .stApp { background-color: #0b1120; }
-      .block-container { padding-top: 2rem; }
+      @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
 
-      /* Titres et textes */
-      h1, h2, h3 { color: #e2e8f0 !important; }
-      p, label, .stMarkdown { color: #94a3b8; }
+      /* ── Reset & base ── */
+      html, body, [class*="css"] { font-family: 'Plus Jakarta Sans', sans-serif !important; }
+      .stApp { background-color: #f0f4ff !important; }
+      .block-container { padding-top: 1.5rem !important; padding-bottom: 3rem !important; max-width: 1100px !important; }
 
-      /* Sidebar */
-      [data-testid="stSidebar"] { background-color: #0e1628; border-right: 1px solid #1e3250; }
-      [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 { color: #e2e8f0 !important; }
+      /* ── Textes globaux ── */
+      h1, h2, h3, h4 { color: #0f1f4b !important; font-family: 'Plus Jakarta Sans', sans-serif !important; }
+      p, label, .stMarkdown p { color: #4a5568 !important; }
 
-      /* Metric cards */
+      /* ── Sidebar ── */
+      [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #0f2d6b 0%, #1a3f8f 100%) !important;
+        border-right: none !important;
+      }
+      [data-testid="stSidebar"] * { color: #e8eeff !important; }
+      [data-testid="stSidebar"] h2,
+      [data-testid="stSidebar"] h3,
+      [data-testid="stSidebar"] strong { color: #ffffff !important; }
+      [data-testid="stSidebar"] .stSelectbox label { color: #b8caf5 !important; font-size: 0.82rem !important; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
+      [data-testid="stSidebar"] [data-testid="stSelectbox"] > div > div {
+        background: rgba(255,255,255,0.12) !important;
+        border: 1px solid rgba(255,255,255,0.2) !important;
+        border-radius: 8px !important;
+        color: #fff !important;
+      }
+      [data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.15) !important; }
+
+      /* ── Metric cards ── */
       [data-testid="metric-container"] {
-        background: #152035; border: 1px solid #1e3250;
-        border-radius: 8px; padding: 12px;
+        background: #ffffff !important;
+        border: 1px solid #dce6ff !important;
+        border-radius: 14px !important;
+        padding: 18px 20px !important;
+        box-shadow: 0 2px 12px rgba(15,45,107,0.07) !important;
       }
-      [data-testid="stMetricValue"] { color: #e2e8f0 !important; font-size: 1.2rem !important; }
-      [data-testid="stMetricLabel"] { color: #94a3b8 !important; }
+      [data-testid="stMetricValue"] { color: #0f2d6b !important; font-size: 1.4rem !important; font-weight: 700 !important; }
+      [data-testid="stMetricLabel"] { color: #7489b0 !important; font-size: 0.8rem !important; font-weight: 600 !important; text-transform: uppercase; letter-spacing: 0.05em; }
 
-      /* Bouton primaire */
-      .stDownloadButton button {
-        background: #10b981 !important; color: white !important;
-        border-radius: 8px !important; border: none !important;
-        font-weight: 600 !important; padding: 0.5rem 1.5rem !important;
+      /* ── Download button ── */
+      .stDownloadButton > button {
+        background: linear-gradient(135deg, #1a56db 0%, #1e40af 100%) !important;
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+        border: none !important;
+        border-radius: 10px !important;
+        font-weight: 700 !important;
+        font-size: 0.95rem !important;
+        padding: 0.65rem 1.8rem !important;
+        letter-spacing: 0.01em !important;
+        box-shadow: 0 4px 14px rgba(26,86,219,0.35) !important;
+        transition: all 0.2s ease !important;
       }
-      .stDownloadButton button:hover { background: #059669 !important; }
+      .stDownloadButton > button * {
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+      }
+      .stDownloadButton > button:hover {
+        background: linear-gradient(135deg, #1d4ed8 0%, #1e3a8a 100%) !important;
+        color: #ffffff !important;
+        box-shadow: 0 6px 20px rgba(26,86,219,0.45) !important;
+        transform: translateY(-1px) !important;
+      }
 
-      /* File uploader */
+      /* ── Primary buttons (convert) ── */
+      .stButton > button {
+        background: linear-gradient(135deg, #1a56db 0%, #1e40af 100%) !important;
+        color: #fff !important; border: none !important;
+        border-radius: 10px !important; font-weight: 700 !important;
+        padding: 0.6rem 1.6rem !important;
+        box-shadow: 0 4px 14px rgba(26,86,219,0.3) !important;
+      }
+      .stButton > button:hover {
+        background: linear-gradient(135deg, #1d4ed8 0%, #1e3a8a 100%) !important;
+        box-shadow: 0 6px 20px rgba(26,86,219,0.4) !important;
+        transform: translateY(-1px) !important;
+      }
+
+      /* ── File uploader ── */
       [data-testid="stFileUploader"] {
-        background: #152035; border: 2px dashed #1e3250;
-        border-radius: 10px; padding: 1rem;
+        background: #ffffff !important;
+        border: 2px dashed #93b4f5 !important;
+        border-radius: 16px !important;
+        padding: 1.5rem !important;
+        box-shadow: 0 2px 12px rgba(15,45,107,0.06) !important;
+        transition: border-color 0.2s;
+      }
+      [data-testid="stFileUploader"]:hover { border-color: #1a56db !important; }
+      [data-testid="stFileUploader"] label { color: #0f2d6b !important; font-weight: 600 !important; }
+      [data-testid="stFileDropzone"] { background: #f5f8ff !important; }
+
+      /* ── Dataframe ── */
+      [data-testid="stDataFrame"] {
+        border: 1px solid #dce6ff !important;
+        border-radius: 12px !important;
+        overflow: hidden !important;
+        box-shadow: 0 2px 12px rgba(15,45,107,0.06) !important;
       }
 
-      /* Dataframe / table */
-      [data-testid="stDataFrame"] { border: 1px solid #1e3250; border-radius: 8px; }
+      /* ── Alert boxes ── */
+      [data-testid="stAlert"] { border-radius: 12px !important; }
 
-      /* Success / info / warning / error */
-      [data-testid="stAlert"] { border-radius: 8px; }
+      /* ── Separators ── */
+      hr { border-color: #dce6ff !important; margin: 1.8rem 0 !important; }
 
-      /* Badge banque */
+      /* ── Custom components ── */
+      .ofx-hero {
+        background: linear-gradient(135deg, #0f2d6b 0%, #1a56db 50%, #2563eb 100%);
+        border-radius: 20px;
+        padding: 2.5rem 2.8rem;
+        margin-bottom: 2rem;
+        position: relative;
+        overflow: hidden;
+      }
+      .ofx-hero::before {
+        content: '';
+        position: absolute; top: -40px; right: -40px;
+        width: 220px; height: 220px;
+        background: rgba(255,255,255,0.06);
+        border-radius: 50%;
+      }
+      .ofx-hero::after {
+        content: '';
+        position: absolute; bottom: -60px; right: 80px;
+        width: 140px; height: 140px;
+        background: rgba(255,255,255,0.04);
+        border-radius: 50%;
+      }
+      .ofx-hero h1 {
+        color: #ffffff !important;
+        font-size: 2rem !important;
+        font-weight: 800 !important;
+        margin: 0 0 0.4rem 0 !important;
+        letter-spacing: -0.02em;
+      }
+      .ofx-hero p {
+        color: rgba(255,255,255,0.78) !important;
+        font-size: 1.05rem !important;
+        margin: 0 !important;
+      }
+      .ofx-hero .badges {
+        margin-top: 1.2rem;
+        display: flex; gap: 10px; flex-wrap: wrap;
+      }
+      .ofx-hero .badge {
+        background: rgba(255,255,255,0.15);
+        border: 1px solid rgba(255,255,255,0.25);
+        color: #fff !important;
+        padding: 4px 14px;
+        border-radius: 20px;
+        font-size: 0.82rem;
+        font-weight: 600;
+      }
+
+      .step-card {
+        background: #fff;
+        border: 1px solid #dce6ff;
+        border-radius: 14px;
+        padding: 1.2rem 1.5rem;
+        display: flex; align-items: flex-start; gap: 14px;
+        box-shadow: 0 2px 10px rgba(15,45,107,0.06);
+      }
+      .step-num {
+        background: linear-gradient(135deg, #1a56db, #2563eb);
+        color: #fff; font-weight: 800; font-size: 1rem;
+        width: 32px; height: 32px; border-radius: 50%;
+        display: flex; align-items: center; justify-content: center;
+        flex-shrink: 0;
+      }
+      .step-text strong { color: #0f2d6b !important; font-size: 0.95rem; }
+      .step-text small { color: #7489b0 !important; font-size: 0.82rem; }
+
       .bank-badge {
-        background: #1e3a5f; color: #3b82f6;
-        padding: 3px 10px; border-radius: 20px;
-        font-size: 0.85rem; font-weight: 600;
-        display: inline-block; margin-bottom: 8px;
+        background: linear-gradient(135deg, #eff6ff, #dbeafe);
+        color: #1a56db !important;
+        border: 1px solid #bfdbfe;
+        padding: 5px 14px; border-radius: 20px;
+        font-size: 0.85rem; font-weight: 700;
+        display: inline-block; margin-bottom: 10px;
+        letter-spacing: 0.01em;
       }
-      .debit-cell { color: #f43f5e !important; font-weight: 600; }
-      .credit-cell { color: #10b981 !important; font-weight: 600; }
 
-      /* Séparateur */
-      hr { border-color: #1e3250; }
+      .result-card {
+        background: #ffffff;
+        border: 1px solid #dce6ff;
+        border-radius: 16px;
+        padding: 1.8rem 2rem;
+        margin-bottom: 1.5rem;
+        box-shadow: 0 4px 20px rgba(15,45,107,0.08);
+      }
+      .result-card .file-title {
+        font-size: 1rem; font-weight: 700; color: #0f2d6b !important;
+        display: flex; align-items: center; gap: 8px; margin-bottom: 1rem;
+      }
+
+      .info-row {
+        background: #f5f8ff;
+        border: 1px solid #dce6ff;
+        border-radius: 10px;
+        padding: 10px 16px;
+        margin-bottom: 1rem;
+        display: flex; gap: 2rem; flex-wrap: wrap;
+      }
+      .info-item { font-size: 0.85rem; color: #4a5568 !important; }
+      .info-item strong { color: #0f2d6b !important; }
+
+      .security-box {
+        background: linear-gradient(135deg, #eff6ff, #f0fdf4);
+        border: 1px solid #bfdbfe;
+        border-radius: 12px;
+        padding: 1rem 1.2rem;
+        margin-top: 0.5rem;
+      }
+      .security-box p { color: #1e40af !important; font-size: 0.88rem !important; margin: 0 !important; }
+
+      .sidebar-label {
+        color: rgba(184,202,245,0.9) !important;
+        font-size: 0.72rem !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.09em !important;
+        text-transform: uppercase !important;
+        margin-bottom: 0.3rem !important;
+      }
+
+      .footer-bar {
+        background: #fff;
+        border: 1px solid #dce6ff;
+        border-radius: 12px;
+        padding: 1rem 1.5rem;
+        display: flex; justify-content: space-between; align-items: center;
+        flex-wrap: wrap; gap: 0.5rem;
+      }
+      .footer-bar span { color: #7489b0 !important; font-size: 0.82rem !important; }
+      .footer-bar .highlight { color: #1a56db !important; font-weight: 700 !important; }
+
+      .empty-state {
+        background: #fff;
+        border: 2px dashed #c3d4f8;
+        border-radius: 20px;
+        padding: 3rem 2rem;
+        text-align: center;
+      }
+      .empty-state .icon { font-size: 3rem; margin-bottom: 1rem; }
+      .empty-state h3 { color: #0f2d6b !important; font-size: 1.2rem !important; margin-bottom: 0.5rem !important; }
+      .empty-state p { color: #7489b0 !important; font-size: 0.9rem !important; }
+
+      /* ── Data editor (tableau éditable) ── */
+      [data-testid="stDataEditor"] {
+        border: 1px solid #dce6ff !important;
+        border-radius: 12px !important;
+        overflow: hidden !important;
+        box-shadow: 0 2px 12px rgba(15,45,107,0.06) !important;
+      }
+      [data-testid="stDataEditor"] [data-testid="glideDataEditor"] {
+        border-radius: 12px !important;
+      }
+      /* Highlight modifié */
+      .edit-notice {
+        background: #fffbeb; border: 1px solid #fcd34d;
+        border-radius: 10px; padding: 10px 16px;
+        font-size: 0.85rem; color: #92400e;
+        margin: 0.5rem 0;
+      }
+
+      /* Spinner override */
+      .stSpinner > div { border-top-color: #1a56db !important; }
+
+      /* Section headers */
+      .section-header {
+        font-size: 1rem; font-weight: 700; color: #0f2d6b !important;
+        margin: 0 0 0.8rem 0; padding-bottom: 0.5rem;
+        border-bottom: 2px solid #e8f0ff;
+      }
     </style>
     """, unsafe_allow_html=True)
 
     # ── SIDEBAR ───────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.markdown("## 💱 OFX Bridge")
-        st.markdown("**v2.1** — Convertisseur PDF → OFX")
-        st.markdown("---")
+        st.markdown("""
+        <div style="padding: 0.5rem 0 1rem 0;">
+          <div style="font-size:1.5rem; font-weight:800; color:#fff; letter-spacing:-0.02em;">💱 OFX Bridge</div>
+          <div style="font-size:0.8rem; color:rgba(255,255,255,0.55); margin-top:2px;">v2.1 — Convertisseur PDF → OFX</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-        # Format logiciel comptable
-        st.markdown("### ⚙️ Format OFX")
+        st.divider()
+
+        st.markdown('<div class="sidebar-label">⚙️ Logiciel comptable cible</div>', unsafe_allow_html=True)
         target = st.selectbox(
             "Logiciel cible",
             options=["Quadra / Cegid", "MyUnisoft", "Sage", "EBP"],
             index=0,
+            label_visibility="collapsed",
             help="Affecte la disposition NAME/MEMO dans le fichier OFX."
         )
         target_map = {"Quadra / Cegid": "quadra", "MyUnisoft": "myunisoft",
                       "Sage": "sage", "EBP": "ebp"}
         target_code = target_map[target]
 
-        st.markdown("---")
-        st.markdown("### 🏦 Banques supportées")
-        banks_list = [
-            "🇫🇷 Qonto", "🇫🇷 LCL", "🇫🇷 Crédit Agricole", "🇫🇷 Caisse d'Épargne",
-            "🇫🇷 Banque Populaire", "🇫🇷 CIC", "🇫🇷 La Banque Postale",
-            "🇫🇷 Société Générale", "🇫🇷 BNP Paribas", "🇵🇹 CGD",
-            "🌍 myPOS", "🇫🇷 Shine",
-            "🌍 CBAO, Ecobank, BCI, Coris", "🌍 UBA, Orabank, BOA",
-            "🌍 ATB, BSIC, BIS, BNDE", "🔍 Format universel",
-        ]
-        for b in banks_list:
-            st.markdown(f"<small>{b}</small>", unsafe_allow_html=True)
+        st.divider()
 
-        st.markdown("---")
         st.markdown("""
-        <div style="background:#1e3a5f;border-radius:8px;padding:10px 14px;margin-top:8px">
-        🔒 <strong style="color:#3b82f6">100 % local</strong><br>
-        <small style="color:#94a3b8">Vos relevés ne quittent jamais ce serveur.
-        Aucun envoi cloud, aucune IA distante.</small>
+        <div class="security-box" style="background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2);">
+          <div style="font-size:0.95rem; font-weight:700; color:#fff; margin-bottom:5px;">🔒 100 % local & sécurisé</div>
+          <div style="font-size:0.82rem; color:rgba(255,255,255,0.7); line-height:1.5;">
+            Vos relevés sont traités <strong style="color:#7dd3fc">directement sur ce serveur</strong>.
+            Aucun fichier n'est envoyé vers le cloud. Aucune IA distante. Aucune inscription requise.
+          </div>
         </div>
         """, unsafe_allow_html=True)
 
-    # ── CONTENU PRINCIPAL ─────────────────────────────────────────────────────
-    st.markdown("# 💱 OFX Bridge")
-    st.markdown("Convertissez vos relevés bancaires PDF en fichiers **OFX** importables dans Quadra, MyUnisoft, Sage ou EBP.")
+        st.divider()
+
+        st.markdown("""
+        <div style="font-size:0.78rem; color:rgba(255,255,255,0.45); line-height:1.7;">
+          <div style="font-weight:700; color:rgba(255,255,255,0.6); margin-bottom:5px; font-size:0.72rem; text-transform:uppercase; letter-spacing:0.08em;">Détection automatique</div>
+          Qonto · LCL · Crédit Agricole · Caisse d'Épargne · Banque Populaire · CIC · La Banque Postale · Société Générale · BNP Paribas · CGD · myPOS · Shine · CBAO · Ecobank · BCI · Coris · UBA · Orabank · BOA · ATB · BSIC · BIS · BNDE · + Format universel
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── HERO HEADER ───────────────────────────────────────────────────────────
+    st.markdown("""
+    <div class="ofx-hero">
+      <h1>💱 Convertisseur PDF → OFX</h1>
+      <p>Importez vos relevés bancaires directement dans Quadra, MyUnisoft, Sage ou EBP — en quelques secondes.</p>
+      <div class="badges">
+        <span class="badge">✓ Détection automatique de la banque</span>
+        <span class="badge">✓ 100 % gratuit &amp; local</span>
+        <span class="badge">✓ Multi-fichiers</span>
+        <span class="badge">✓ Aucune inscription</span>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
     # Vérification dépendances
     if not _PDFPLUMBER_OK:
         st.error("❌ **pdfplumber n'est pas installé.** Ajoutez `pdfplumber` à votre `requirements.txt` et relancez l'application.")
         st.stop()
 
-    st.markdown("---")
+    # ── Comment ça marche ─────────────────────────────────────────────────────
+    col_s1, col_s2, col_s3 = st.columns(3)
+    with col_s1:
+        st.markdown("""<div class="step-card">
+          <div class="step-num">1</div>
+          <div class="step-text"><strong>Déposez votre PDF</strong><br><small>Relevé bancaire natif ou scanné (OCR)</small></div>
+        </div>""", unsafe_allow_html=True)
+    with col_s2:
+        st.markdown("""<div class="step-card">
+          <div class="step-num">2</div>
+          <div class="step-text"><strong>Corrigez si nécessaire</strong><br><small>Tableau éditable : date, libellé, montant, type</small></div>
+        </div>""", unsafe_allow_html=True)
+    with col_s3:
+        st.markdown("""<div class="step-card">
+          <div class="step-num">3</div>
+          <div class="step-text"><strong>Téléchargez l'OFX</strong><br><small>Compatible avec votre logiciel comptable</small></div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("<div style='height:1.5rem'></div>", unsafe_allow_html=True)
 
     # ── Upload ────────────────────────────────────────────────────────────────
-    st.markdown("### 📂 Sélection des fichiers PDF")
+    st.markdown('<div class="section-header">📂 Sélection des fichiers PDF</div>', unsafe_allow_html=True)
     uploaded_files = st.file_uploader(
-        "Déposez un ou plusieurs relevés bancaires au format PDF",
+        "Glissez-déposez un ou plusieurs relevés bancaires au format PDF",
         type=["pdf"],
         accept_multiple_files=True,
-        help="Formats supportés : PDF natif (texte extractible). Les PDF scannés nécessitent Tesseract OCR."
+        help="PDF natif (texte extractible) recommandé. Les PDF scannés nécessitent Tesseract OCR."
     )
 
     if not uploaded_files:
-        st.info("👆 Déposez un relevé PDF pour commencer la conversion.")
-        # Petite démo d'état vide
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Transactions", "—")
-        with col2:
-            st.metric("Total Débits", "—")
-        with col3:
-            st.metric("Total Crédits", "—")
+        st.markdown("""
+        <div class="empty-state">
+          <div class="icon">📄</div>
+          <h3>Aucun fichier sélectionné</h3>
+          <p>Glissez-déposez vos relevés PDF ci-dessus pour démarrer la conversion.<br>
+          La banque est détectée automatiquement — aucune configuration requise.</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)
+        with c1: st.metric("Transactions", "—")
+        with c2: st.metric("Total Débits", "—")
+        with c3: st.metric("Total Crédits", "—")
         st.stop()
 
     # ── Traitement de chaque fichier ──────────────────────────────────────────
+    import pandas as pd
+
     for uploaded_file in uploaded_files:
-        st.markdown(f"---")
-        st.markdown(f"### 📄 `{uploaded_file.name}`")
+        st.markdown(f"<div style='height:0.5rem'></div>", unsafe_allow_html=True)
 
         file_bytes = uploaded_file.read()
 
-        with st.spinner(f"Analyse de {uploaded_file.name}…"):
+        with st.spinner(f"Analyse de « {uploaded_file.name} »…"):
             bank, info, txns, error = process_pdf(file_bytes, uploaded_file.name)
+
+        # ── Carte de résultat ──────────────────────────────────────────────────
+        st.markdown('<div class="result-card">', unsafe_allow_html=True)
+        st.markdown(f'<div class="file-title">📄 {uploaded_file.name}</div>', unsafe_allow_html=True)
 
         if error:
             st.error(f"❌ **Erreur :** {error}")
+            st.markdown('</div>', unsafe_allow_html=True)
             continue
 
         if not txns:
-            st.warning("⚠️ Aucune transaction détectée dans ce fichier. Vérifiez qu'il s'agit bien d'un relevé bancaire.")
+            st.warning("⚠️ Aucune transaction détectée. Vérifiez qu'il s'agit bien d'un relevé bancaire.")
+            st.markdown('</div>', unsafe_allow_html=True)
             continue
 
-        # ── Badge banque ──────────────────────────────────────────────────────
+        # Badge banque + infos
         bank_label = BANK_LABELS.get(bank, bank)
         currency   = BANK_CURRENCY.get(bank, 'EUR')
-        st.markdown(f'<span class="bank-badge">🏦 {bank_label}</span>', unsafe_allow_html=True)
 
-        # Infos période / IBAN
-        col_a, col_b = st.columns(2)
-        with col_a:
-            period_str = ""
-            if info.get('period_start') and info.get('period_end'):
-                period_str = f"{info['period_start']} → {info['period_end']}"
-            st.markdown(f"**Période :** {period_str or '—'}")
-        with col_b:
-            iban_display = info.get('iban', '') or '—'
-            st.markdown(f"**IBAN / Compte :** `{iban_display}`")
+        period_str = ""
+        if info.get('period_start') and info.get('period_end'):
+            period_str = f"{info['period_start']} → {info['period_end']}"
+        iban_display = info.get('iban', '') or '—'
 
-        # ── Métriques ─────────────────────────────────────────────────────────
+        st.markdown(f"""
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:1rem; flex-wrap:wrap;">
+          <span class="bank-badge">🏦 {bank_label}</span>
+          <span style="font-size:0.85rem; color:#4a5568">
+            {'📅 ' + period_str if period_str else ''}
+            {'&nbsp;&nbsp;|&nbsp;&nbsp;🔑 ' + iban_display if iban_display != '—' else ''}
+          </span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Métriques ──────────────────────────────────────────────────────────
         total_debit  = sum(abs(t['amount']) for t in txns if t['type'] == 'DEBIT')
         total_credit = sum(t['amount']      for t in txns if t['type'] == 'CREDIT')
+        balance      = total_credit - total_debit
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("📊 Transactions", f"{len(txns)}")
+            st.metric("Transactions", f"{len(txns)}")
         with col2:
-            st.metric("🔴 Total Débits",  fmt_amount(total_debit,  currency))
+            st.metric("Total Débits", fmt_amount(total_debit, currency))
         with col3:
-            st.metric("🟢 Total Crédits", fmt_amount(total_credit, currency))
+            st.metric("Total Crédits", fmt_amount(total_credit, currency))
+        with col4:
+            delta_label = "positif" if balance >= 0 else "négatif"
+            st.metric("Solde net", fmt_amount(abs(balance), currency),
+                      delta=f"{'+'  if balance >= 0 else '-'}{fmt_amount(abs(balance), currency)}",
+                      delta_color="normal" if balance >= 0 else "inverse")
 
-        # ── Tableau de transactions ───────────────────────────────────────────
-        st.markdown("#### Aperçu des transactions")
+        # ── Tableau ÉDITABLE ───────────────────────────────────────────────────
+        file_key = uploaded_file.name.replace('.', '_').replace(' ', '_')
 
-        import pandas as pd
-        rows_data = []
+        st.markdown(f"""
+        <div class="section-header" style="margin-top:1.2rem">
+          ✏️ Vérification &amp; correction des transactions
+          <span style="font-size:0.78rem; font-weight:500; color:#7489b0; margin-left:10px;">
+            Cliquez sur une cellule pour modifier • Supprimer une ligne avec la case à gauche
+          </span>
+        </div>""", unsafe_allow_html=True)
+
+        # Construction du DataFrame éditable (montants numériques)
+        edit_rows = []
         for t in txns:
             d = t['date']
             date_fmt = f"{d[6:8]}/{d[4:6]}/{d[0:4]}"
             is_debit = t['type'] == 'DEBIT'
-            rows_data.append({
-                "Date":    date_fmt,
-                "Type":    "💸 Débit" if is_debit else "💰 Crédit",
-                "Libellé": t['name'],
-                "Mémo":    t.get('memo', '') or '',
-                "Débit":   fmt_amount(abs(t['amount']), currency) if is_debit  else "",
-                "Crédit":  fmt_amount(t['amount'],      currency) if not is_debit else "",
+            edit_rows.append({
+                "📅 Date":    date_fmt,
+                "Type":       "Débit" if is_debit else "Crédit",
+                "Libellé":    t['name'],
+                "Mémo":       t.get('memo', '') or '',
+                "Montant":    round(abs(t['amount']), 2),
             })
 
-        df = pd.DataFrame(rows_data)
-        st.dataframe(
-            df,
+        df_edit = pd.DataFrame(edit_rows)
+
+        edited_df = st.data_editor(
+            df_edit,
             use_container_width=True,
-            height=min(400, 40 + 35 * len(df)),
-            hide_index=True,
+            height=min(480, 60 + 38 * len(df_edit)),
+            hide_index=False,
+            num_rows="dynamic",
+            key=f"editor_{file_key}",
             column_config={
-                "Date":    st.column_config.TextColumn("Date",    width=90),
-                "Type":    st.column_config.TextColumn("Type",    width=100),
-                "Libellé": st.column_config.TextColumn("Libellé", width=250),
-                "Mémo":    st.column_config.TextColumn("Mémo",    width=200),
-                "Débit":   st.column_config.TextColumn("Débit",   width=110),
-                "Crédit":  st.column_config.TextColumn("Crédit",  width=110),
-            }
+                "📅 Date":  st.column_config.TextColumn(
+                    "📅 Date", width=105,
+                    help="Format JJ/MM/AAAA — modifiable directement",
+                ),
+                "Type": st.column_config.SelectboxColumn(
+                    "Type", width=100,
+                    options=["Débit", "Crédit"],
+                    required=True,
+                    help="Inverser Débit ↔ Crédit si mal détecté",
+                ),
+                "Libellé": st.column_config.TextColumn(
+                    "Libellé", width=260,
+                    help="Nom de la transaction exporté dans NAME",
+                ),
+                "Mémo": st.column_config.TextColumn(
+                    "Mémo", width=200,
+                    help="Champ MEMO dans l'OFX",
+                ),
+                "Montant": st.column_config.NumberColumn(
+                    f"Montant ({currency})", width=130,
+                    min_value=0.0, step=0.01, format="%.2f",
+                    help="Valeur absolue — le signe est géré par le Type",
+                ),
+            },
         )
 
-        # ── Génération et téléchargement OFX ─────────────────────────────────
-        st.markdown("#### 📥 Télécharger le fichier OFX")
+        # Indicateur de modifications
+        orig_hash = str(df_edit.values.tolist())
+        edit_hash = str(edited_df.values.tolist())
+        has_changes = (orig_hash != edit_hash)
+        nb_edited   = len(edited_df)
 
-        ofx_content = generate_ofx(info, txns, target=target_code, currency=currency)
+        if has_changes:
+            st.markdown("""
+            <div style="background:#fffbeb; border:1px solid #fcd34d; border-radius:10px;
+                        padding:10px 16px; margin:0.5rem 0; font-size:0.85rem; color:#92400e;">
+              ✏️ <strong>Modifications détectées</strong> — L'OFX sera généré depuis le tableau corrigé ci-dessus.
+            </div>""", unsafe_allow_html=True)
+
+        # ── Reconstruction des transactions depuis le tableau édité ────────────
+        txns_final = []
+        errors_edit = []
+        for idx, row in edited_df.iterrows():
+            try:
+                raw_date  = str(row.get("📅 Date", "")).strip()
+                txn_type  = str(row.get("Type", "Débit")).strip()
+                label     = str(row.get("Libellé", "")).strip()
+                memo      = str(row.get("Mémo", "")).strip()
+                montant   = float(row.get("Montant", 0) or 0)
+
+                if not raw_date or not label or montant == 0:
+                    continue
+
+                # Conversion date JJ/MM/AAAA → AAAAMMJJ
+                date_ofx = date_full_to_ofx(raw_date)
+                if not re.match(r'^\d{8}$', date_ofx):
+                    errors_edit.append(f"Ligne {idx+1} : date invalide « {raw_date} »")
+                    continue
+
+                amount = -montant if txn_type == "Débit" else montant
+                txn = _make_txn(date_ofx, amount, label[:64], memo[:128])
+                if txn:
+                    txns_final.append(txn)
+            except Exception as ex:
+                errors_edit.append(f"Ligne {idx+1} : {ex}")
+
+        if errors_edit:
+            for err in errors_edit:
+                st.warning(f"⚠️ {err}")
+
+        # Métriques recalculées sur les données éditées
+        if has_changes and txns_final:
+            total_debit_e  = sum(abs(t['amount']) for t in txns_final if t['type'] == 'DEBIT')
+            total_credit_e = sum(t['amount']      for t in txns_final if t['type'] == 'CREDIT')
+            balance_e      = total_credit_e - total_debit_e
+            col1e, col2e, col3e, col4e = st.columns(4)
+            with col1e: st.metric("Transactions (éditées)", f"{len(txns_final)}")
+            with col2e: st.metric("Total Débits",  fmt_amount(total_debit_e,  currency))
+            with col3e: st.metric("Total Crédits", fmt_amount(total_credit_e, currency))
+            with col4e: st.metric("Solde net", fmt_amount(abs(balance_e), currency),
+                                  delta=f"{'+'if balance_e>=0 else '-'}{fmt_amount(abs(balance_e),currency)}",
+                                  delta_color="normal" if balance_e >= 0 else "inverse")
+
+        # OFX généré depuis les données (potentiellement éditées)
+        txns_for_ofx = txns_final if txns_final else txns
+
+        # ── Téléchargement OFX ─────────────────────────────────────────────────
+        st.markdown('<div class="section-header" style="margin-top:1.2rem">⬇️ Télécharger le fichier OFX</div>', unsafe_allow_html=True)
+
+        ofx_content = generate_ofx(info, txns_for_ofx, target=target_code, currency=currency)
         ofx_bytes   = ofx_content.encode('latin-1', errors='replace')
         ofx_name    = Path(uploaded_file.name).stem + ".ofx"
 
-        col_dl1, col_dl2 = st.columns([1, 3])
+        col_dl1, col_dl2 = st.columns([2, 3])
         with col_dl1:
             st.download_button(
-                label=f"⬇️ Télécharger {ofx_name}",
+                label=f"⬇️  Télécharger {ofx_name}",
                 data=ofx_bytes,
                 file_name=ofx_name,
                 mime="application/x-ofx",
-                key=f"dl_{uploaded_file.name}",
+                key=f"dl_{file_key}",
+                use_container_width=True,
             )
         with col_dl2:
-            st.caption(
-                f"Format : OFX Standard ({target}) · "
-                f"Devise : {currency} · "
-                f"{len(txns)} transactions · "
-                f"Encodage : Latin-1 (compatible Cegid/MyUnisoft)"
-            )
+            st.markdown(f"""
+            <div style="padding:0.6rem 0; font-size:0.83rem; color:#7489b0; line-height:1.7;">
+              <b style="color:#0f2d6b">Format :</b> OFX Standard ({target})
+              &nbsp;&nbsp;·&nbsp;&nbsp;
+              <b style="color:#0f2d6b">Devise :</b> {currency}
+              &nbsp;&nbsp;·&nbsp;&nbsp;
+              <b style="color:#0f2d6b">{len(txns_for_ofx)} transactions</b>
+              {'&nbsp;&nbsp;·&nbsp;&nbsp;<span style="color:#d97706;font-weight:600">✏️ Données corrigées</span>' if has_changes else ''}
+              &nbsp;&nbsp;·&nbsp;&nbsp;
+              Encodage Latin-1 (Cegid / MyUnisoft)
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown('</div>', unsafe_allow_html=True)  # .result-card
 
     # ── Footer ────────────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown(
-        "<small style='color:#4a6080'>OFX Bridge v2.1 — Traitement 100 % local · "
-        "Aucune donnée envoyée vers un serveur externe</small>",
-        unsafe_allow_html=True
-    )
+    st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+    st.markdown("""
+    <div class="footer-bar">
+      <span>💱 <span class="highlight">OFX Bridge</span> v2.1</span>
+      <span>🔒 Traitement 100 % local — Aucune donnée envoyée vers un serveur externe</span>
+      <span>✉️ Compatible Quadra · MyUnisoft · Sage · EBP</span>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
