@@ -1,6 +1,0 @@
-streamlit
-pdfplumber
-pydantic
-pytesseract
-pdf2image
-pymupdf
