@@ -483,7 +483,16 @@ def detect_bank(pages_text):
         return 'NSIA'
     if 'CBAO' in text or 'COMPAGNIE BANCAIRE DE L' in text:
         return 'CBAO'
-    if 'ECOBANK' in text or 'ECOBANK SENEGAL' in text:
+    if 'ECOBANK' in text or 'ECOBANK SENEGAL' in text or 'PAN AFRICAN BANK' in text:
+        return 'ECOBANK'
+    # Détection Ecobank quand le logo est une image (pas de texte "ECOBANK")
+    # Le relevé anglais Ecobank contient "Account Statement" + "Payments" + "Deposits"
+    # et le format de date DD-Mon-YYYY (ex: "30-May-2025")
+    if ('ACCOUNT STATEMENT' in text and 'PAYMENTS' in text and 'DEPOSITS' in text
+            and re.search(r'\d{2}-[A-Z][A-Z][A-Z]-\d{4}', text)):
+        return 'ECOBANK'
+    # Détection par en-tête anglais Ecobank : "Statement From Date" + "Statement To Date"
+    if 'STATEMENT FROM DATE' in text and 'STATEMENT TO DATE' in text:
         return 'ECOBANK'
     if 'BANQUE POUR LE COMMERCE' in text and 'INDUSTRIE' in text:
         return 'BCI'
@@ -2771,22 +2780,29 @@ def parse_cbao(pages_words, pages_text, _pdf_path=''):
     SKIP_CONTAINS = ('SUJETS À MODIFICATION', 'SUJETS A MODIFICATION',
                      'ÉVÈNEMENTS DU JOUR', 'EVENEMENTS DU JOUR')
 
-    # Seuils de colonnes CBAO (en points PDF, mesurés sur le relevé CB MOTORS mars 2026)
+    # Seuils de colonnes CBAO — recalibrés sur relevé CB MOTORS mars 2026
+    # En-têtes réels : "Débit (XOF)" x0≈363, "Crédit (XOF)" x0≈421, "Solde (XOF)" x0≈503
+    # Montants débit  : x0 ≈ 355–440  (FRA/COM=371, WOLF=360, W Cartes 1454350=365, W Fac 356950=371)
+    # Montants crédit : x0 ≈ 440–510  (SUNSTEEL 920400=452, RTRACTAFRIC 1121000=446)
+    # Montants solde  : x0 ≥ 510      (ignorés)
     CBAO_DATE_MAX    = 75    # x0 < 75  → colonne Date
     CBAO_LABEL_MIN   = 140   # x0 ≥ 140 → début libellé
-    CBAO_LABEL_MAX   = 400   # x0 < 400 → fin libellé
-    CBAO_DEBIT_MIN   = 400   # x0 ≥ 400 → zone montants droite
-    CBAO_DEBIT_MAX   = 510   # x0 < 510 → débit (colonne gauche)
-    CBAO_CREDIT_MIN  = 510   # x0 ≥ 510 → crédit (colonne droite)
-    CBAO_SOLDE_MIN   = 620   # x0 ≥ 620 → solde (ignoré)
+    CBAO_LABEL_MAX   = 355   # x0 < 355 → fin libellé
+    CBAO_DEBIT_MIN   = 355   # x0 ≥ 355 → zone montants droite
+    CBAO_DEBIT_MAX   = 440   # x0 < 440 → débit
+    CBAO_CREDIT_MIN  = 440   # x0 ≥ 440 → crédit
+    CBAO_SOLDE_MIN   = 510   # x0 ≥ 510 → solde (ignoré)
 
     # Mots-clés sémantiques pour lever l'ambiguïté débit/crédit quand
-    # un seul montant est présent et la position ne suffit pas
-    CREDIT_KW = {'VIREMENT RECU', 'VIRMT ORD', 'VIREMENT RTRACTAFRIC',
-                 'RTRACTAFRIC SENEGAL', 'RTRACTAFRIC',
+    # la position X seule ne suffit pas (montant unique sans colonne claire)
+    # NB CB MOTORS mars 2026 — position x0 suffit pour la majorité :
+    #   Débit  x0 ≈ 355–440 : FRA/COM, SAISIE TRF WOLF OIL, W Cartes 1454350, W Fac 356950
+    #   Crédit x0 ≈ 440–510 : SUNSTEEL 920400, RTRACTAFRIC 1121000
+    #   Seuls cas à lever par sémantique : montant unique sans position claire
+    CREDIT_KW = {'VIREMENT RECU', 'VIRMT ORD', 'RTRACTAFRIC',
                  'CREDIT', 'VERSEMENT', 'REMISE'}
     DEBIT_KW  = {'FRAIS', 'COMMISSION', 'SAISIE TRF', 'RETRAIT', 'CHEQUE',
-                 'FRA/COM', 'FRAIS/', 'VIREMENT W'}
+                 'FRA/COM', 'FRAIS/', 'FAV.'}
 
     # Lecture du solde final et initial
     full_text = ' '.join(pages_text)
@@ -2798,13 +2814,31 @@ def parse_cbao(pages_words, pages_text, _pdf_path=''):
         if v:
             info['balance_close'] = v
 
+    # Solde initial (balance_open) — utilisé pour initialiser prev_solde
+    m_open = re.search(r'Solde\s+initial\s+\([A-Z]+\)\s*:\s*([\d\s]+)', full_text, re.IGNORECASE)
+    if m_open:
+        v = parse_amount(m_open.group(1).strip().replace(' ', ''))
+        if v:
+            info['balance_open'] = v
+
     def _cbao_resolve_amounts(row_words):
         """
         Extrait les montants débit/crédit d'une ligne CBAO.
         Retourne (debit_amt, credit_amt) — l'un des deux est None.
         Les montants CBAO sont des entiers XOF sans décimale (ex: 920 400).
         La colonne solde (x0 ≥ CBAO_SOLDE_MIN) est ignorée.
+
+        Cas particulier CB MOTORS : quand le libellé contient "W Cartes ess 5 850"
+        ou "W Factures m 5 850", le "5 850" est un numéro de compte (référence),
+        pas un montant débit. On détecte cela : si le seul bloc numérique en zone
+        débit est entièrement composé de tokens qui apparaissent aussi dans le libellé
+        (même texte, même position proche), on le considère comme référence et on
+        retourne (None, None) — le caller utilisera la sémantique / le montant sera
+        éventuellement fourni par une ligne de continuation.
         """
+        # Tokens du libellé (pour détecter les numéros de compte)
+        label_texts = {w['text'] for w in row_words if CBAO_LABEL_MIN <= w['x0'] < CBAO_LABEL_MAX}
+
         # Récupérer uniquement les mots numériques dans la zone montants
         right_words = sorted(
             [w for w in row_words if w['x0'] >= CBAO_DEBIT_MIN and re.search(r'\d', w['text'])],
@@ -2836,6 +2870,10 @@ def parse_cbao(pages_words, pages_text, _pdf_path=''):
             x0_bloc = b[0]['x0']
             if x0_bloc >= CBAO_SOLDE_MIN:
                 continue   # ignorer la colonne Solde
+            # Filtre référence-compte : si tous les tokens de ce bloc figurent aussi
+            # dans le libellé (numéro de compte glissé dans le label), ignorer ce bloc
+            if all(w['text'] in label_texts for w in b):
+                continue
             v = _uba_join_amount(b)
             if v is not None and v > 0:
                 resolved.append((v, x0_bloc))
@@ -2857,7 +2895,7 @@ def parse_cbao(pages_words, pages_text, _pdf_path=''):
             else:
                 return c_left[0], None
 
-    def _cbao_assign_side(val, x0, label_up):
+    def _cbao_assign_side(val, x0, label_up, row_words=None):
         """Assigne un montant unique au débit ou crédit selon sa position X et le libellé."""
         is_credit = any(k in label_up for k in CREDIT_KW)
         is_debit  = any(k in label_up for k in DEBIT_KW)
@@ -2865,7 +2903,7 @@ def parse_cbao(pages_words, pages_text, _pdf_path=''):
             return None, val
         if is_debit and not is_credit:
             return val, None
-        # Fallback position : ≥ CBAO_CREDIT_MIN → crédit
+        # Fallback position : ≥ CBAO_CREDIT_MIN → crédit, sinon débit
         if x0 >= CBAO_CREDIT_MIN:
             return None, val
         return val, None
@@ -2877,6 +2915,8 @@ def parse_cbao(pages_words, pages_text, _pdf_path=''):
     for pw in pages_words:
         rows = group_words_by_row(pw, tol=5.0)
         i = 0
+        # Initialiser prev_solde depuis le solde initial du relevé
+        prev_solde = info.get('balance_open') or info.get('balance_close') or None
         while i < len(rows):
             row = rows[i]
 
@@ -2906,17 +2946,73 @@ def parse_cbao(pages_words, pages_text, _pdf_path=''):
 
             # Un seul montant résolu → assigner via sémantique + position
             if d_val is not None and c_val is None:
-                # Trouver la position x0 du bloc résolu
-                right_w = sorted([w for w in row if w['x0'] >= CBAO_DEBIT_MIN and re.search(r'\d', w['text'])],
-                                  key=lambda w: w['x0'])
-                x0_val = right_w[0]['x0'] if right_w else CBAO_DEBIT_MIN
-                d_val, c_val = _cbao_assign_side(d_val, x0_val, label_up)
+                # Lire le solde courant (colonne Solde x0 ≥ CBAO_SOLDE_MIN)
+                solde_toks = sorted([w for w in row if w['x0'] >= CBAO_SOLDE_MIN
+                                     and re.search(r'\d', w['text'])], key=lambda w: w['x0'])
+                curr_solde = None
+                if solde_toks:
+                    try:
+                        curr_solde = float(''.join(w['text'] for w in solde_toks).replace(' ',''))
+                    except Exception:
+                        pass
+
+                # Si prev_solde connu → le sens est donné par la variation du solde
+                if curr_solde is not None and prev_solde is not None:
+                    if curr_solde > prev_solde:
+                        d_val, c_val = None, d_val   # solde augmente → crédit
+                    else:
+                        d_val, c_val = d_val, None   # solde diminue → débit
+                else:
+                    # Fallback sémantique + position
+                    right_w = sorted([w for w in row if w['x0'] >= CBAO_DEBIT_MIN and re.search(r'\d', w['text'])],
+                                      key=lambda w: w['x0'])
+                    x0_val = right_w[0]['x0'] if right_w else CBAO_DEBIT_MIN
+                    d_val, c_val = _cbao_assign_side(d_val, x0_val, label_up, row_words=row)
+
+                # Mettre à jour prev_solde pour la prochaine transaction
+                if curr_solde is not None:
+                    prev_solde = curr_solde
+            elif d_val is None and c_val is not None:
+                # Crédit direct (2 blocs résolus) : lire solde aussi
+                solde_toks = sorted([w for w in row if w['x0'] >= CBAO_SOLDE_MIN
+                                     and re.search(r'\d', w['text'])], key=lambda w: w['x0'])
+                if solde_toks:
+                    try:
+                        prev_solde = float(''.join(w['text'] for w in solde_toks).replace(' ',''))
+                    except Exception:
+                        pass
+            elif d_val is not None and c_val is not None:
+                # 2 blocs (débit + crédit simultanés) : cas rare, lire solde
+                solde_toks = sorted([w for w in row if w['x0'] >= CBAO_SOLDE_MIN
+                                     and re.search(r'\d', w['text'])], key=lambda w: w['x0'])
+                if solde_toks:
+                    try:
+                        prev_solde = float(''.join(w['text'] for w in solde_toks).replace(' ',''))
+                    except Exception:
+                        pass
+            else:
+                # Lire solde même si pas de montant (pour initialiser prev_solde)
+                solde_toks = sorted([w for w in row if w['x0'] >= CBAO_SOLDE_MIN
+                                     and re.search(r'\d', w['text'])], key=lambda w: w['x0'])
+                if solde_toks:
+                    try:
+                        prev_solde = float(''.join(w['text'] for w in solde_toks).replace(' ',''))
+                    except Exception:
+                        pass
 
             debit_amt  = d_val
             credit_amt = c_val
 
-            if debit_amt is None and credit_amt is None:
-                i += 1; continue
+            # Si (None, None) : le montant a peut-être été filtré comme numéro de référence
+            # (ex: "W Cartes ess 5 850" où 5 850 est un compte, le vrai montant est sur la
+            # ligne de continuation). On ne skippe PAS — on continue pour ramasser la suite.
+            has_ref_only = (debit_amt is None and credit_amt is None and
+                            any(w['x0'] >= CBAO_DEBIT_MIN and re.search(r'\d', w['text'])
+                                for w in row))
+
+            # Cas spécial : "VIREMENT W … 5 850" — le petit nombre (≤ 9 999) affiché dans
+            # la colonne débit est un numéro de compte CBAO, pas un montant débit réel.
+            # Ce cas est géré par le tracking du solde ci-dessous (prev_solde).
 
             # ── Lignes de continuation (mémo ou transaction séparée) ───────────
             memo_parts = []
@@ -2947,13 +3043,28 @@ def parse_cbao(pages_words, pages_text, _pdf_path=''):
                         right_w2 = sorted([w for w in r2 if w['x0'] >= CBAO_DEBIT_MIN
                                            and re.search(r'\d', w['text'])], key=lambda w: w['x0'])
                         x0_v2 = right_w2[0]['x0'] if right_w2 else CBAO_DEBIT_MIN
-                        r2_d, r2_c = _cbao_assign_side(r2_d, x0_v2, nl_up)
+                        r2_d, r2_c = _cbao_assign_side(r2_d, x0_v2, nl_up, row_words=r2)
                     date_ofx_r2 = date_full_to_ofx(date_str)
-                    r2_name, r2_memo = smart_label(nl_label, [])
-                    if r2_d and r2_d > 0:
-                        continuation_txns.append(_make_txn(date_ofx_r2, -r2_d, r2_name, r2_memo))
-                    elif r2_c and r2_c > 0:
-                        continuation_txns.append(_make_txn(date_ofx_r2, r2_c, r2_name, r2_memo))
+
+                    if has_ref_only:
+                        # La ligne principale avait uniquement un numéro de compte en guise
+                        # de montant (ex: "W Cartes ess 5 850") — la vraie transaction est ici.
+                        # On fusionne : libellé principal + libellé continuation
+                        full_label = label + (' ' + nl_label if nl_label else '')
+                        fn, fm = smart_label(full_label, memo_parts)
+                        if r2_d and r2_d > 0:
+                            txns.append(_make_txn(date_ofx_r2, -r2_d, fn, fm))
+                        elif r2_c and r2_c > 0:
+                            txns.append(_make_txn(date_ofx_r2, r2_c, fn, fm))
+                        # Marquer qu'on a consommé la continuation
+                        has_ref_only = False
+                        debit_amt = credit_amt = None  # empêche l'émission ci-dessous
+                    else:
+                        r2_name, r2_memo = smart_label(nl_label, [])
+                        if r2_d and r2_d > 0:
+                            continuation_txns.append(_make_txn(date_ofx_r2, -r2_d, r2_name, r2_memo))
+                        elif r2_c and r2_c > 0:
+                            continuation_txns.append(_make_txn(date_ofx_r2, r2_c, r2_name, r2_memo))
                 elif nl_label and not any(s in nl_up for s in SKIP):
                     # Pas de montant → mémo de la ligne courante
                     memo_parts.append(nl_label)
@@ -2979,18 +3090,38 @@ def parse_cbao(pages_words, pages_text, _pdf_path=''):
 
 # ════════════════════════════════════════════════════════════════════════════
 # BOA — Bank of Africa Sénégal
-# Format : Date op | Date val | Libellé-Description | Référence | Débit | Crédit | Solde
+# Format : Date op | Description | Référence | Date valeur | Débit | Crédit | Solde courant
 # En-tête  : "BANK OF AFRICA" / "BANK OF AFRICA - SENEGAL"
-# Positions mesurées sur relevé BOA ATS AZIMUT SERVICES (novembre 2025) :
-#   Date op     : x0 ≈ 29–58   (DD/MM/YY, 2 chiffres pour l'année)
-#   Date val    : x0 ≈ 68–96   (ignoré)
-#   Libellé     : x0 ≈ 100–340
-#   Référence   : x0 ≈ 340–390 (ignoré — alphanumérique court)
-#   Débit       : x0 ≈ 390–440 (montant en XOF, sans décimales)
-#   Crédit      : x0 ≈ 440–490 (montant en XOF, sans décimales)
-#   Solde       : x0 ≈ 495–540 (ignoré — running balance négatif)
-# NOTE : Les dates sont au format DD/MM/YY (2 chiffres) → normaliser en DD/MM/YYYY
-# IMPORTANT : La colonne "Solde" NE DOIT PAS être utilisée comme montant de transaction.
+#
+# Positions mesurées sur deux relevés réels :
+#   BOA ATS AZIMUT SERVICES (nov 2025) :
+#     Date op   : x0 ≈ 29–58   (DD/MM/YY)
+#     Libellé   : x0 ≈ 100–340
+#     Référence : x0 ≈ 258–284 (alphanumérique court)
+#     Date val  : x0 ≈ 312–341
+#     Débit     : x0 ≈ 390–440  ← seuil précédent (trop haut)
+#     Crédit    : x0 ≈ 440–495
+#     Solde     : x0 ≈ 495–540
+#
+#   BOA VILLA YEMAYA (jan 2026) :
+#     Date op   : x0 ≈ 41–70   (DD/MM/YY)
+#     Libellé   : x0 ≈ 91–242
+#     Référence : x0 ≈ 258–284
+#     Date val  : x0 ≈ 312–341
+#     Débit     : x0 ≈ 365–412  (montants négatifs : "-200", "000,00")
+#     Crédit    : x0 ≈ 442–485  (montants positifs sans signe)
+#     Solde     : x0 ≈ 517–561
+#
+# → Seuils unifiés couvrant les deux formats :
+#     DEBIT_X_MIN  = 355   (assez bas pour capturer x0=365)
+#     DEBIT_X_MAX  = 440   (limite avant crédit)
+#     CREDIT_X_MIN = 440
+#     CREDIT_X_MAX = 510
+#     SOLDE_X_MIN  = 510
+#
+# NOTE : Les débits BOA sont encodés avec un signe '-' DANS la colonne débit
+#        (ex : "-200" + "000,00" = -200 000 XOF).  Le signe négatif identifie
+#        le débit ; l'absence de signe dans la zone crédit identifie le crédit.
 # ════════════════════════════════════════════════════════════════════════════
 def parse_boa(pages_words, pages_text, _pdf_path=''):
     info = _afr_header(pages_text)
@@ -3063,17 +3194,16 @@ def parse_boa(pages_words, pages_text, _pdf_path=''):
                 i += 1; continue
 
             # ── Montants BOA ─────────────────────────────────────────────────
-            # Positions mesurées sur ce PDF :
-            #   Débit  : x0 ≈ 390–440  (en-tête "Débit" à x0=396)
-            #   Crédit : x0 ≈ 440–495  (en-tête "Crédit" à x0=445)
-            #   Solde  : x0 ≈ 495–540  (à ignorer)
-            # Les montants XOF sont des entiers (ex: "200 000", "3 000 000")
-            # répartis en plusieurs tokens séparés par espaces (milliers).
-            DEBIT_X_MIN  = 388
+            # Seuils unifiés couvrant BOA ATS (nov 2025) et BOA VILLA YEMAYA (jan 2026) :
+            #   Débit  x0 ≈ 355–440  (ATS: 390–440 | VILLA: 365–412)
+            #   Crédit x0 ≈ 440–510  (ATS: 440–495 | VILLA: 442–485)
+            #   Solde  x0 ≥ 510      (ignoré)
+            # Les débits ont un signe '-' explicite (ex: "-200" + "000,00").
+            DEBIT_X_MIN  = 355
             DEBIT_X_MAX  = 440
             CREDIT_X_MIN = 440
-            CREDIT_X_MAX = 495
-            SOLDE_X_MIN  = 495   # ignoré
+            CREDIT_X_MAX = 510
+            SOLDE_X_MIN  = 510
 
             right_words = sorted(
                 [w for w in row if w['x0'] >= DEBIT_X_MIN
@@ -3908,6 +4038,11 @@ def parse_ecobank(pages_words, pages_text, _pdf_path=''):
                 return f"{yyyy}{mm}{dd.zfill(2)}"
         return str(year)+'0101'
 
+    # Solde précédent (partagé entre toutes les pages)
+    _eco_prev_solde = None
+    # Flag pour ignorer la ligne complémentaire d'une paire B/O annulée
+    _eco_skip_next_bo = False
+
     for pw in pages_words:
         rows = group_words_by_row(pw, tol=4.0)
         i = 0
@@ -3922,33 +4057,31 @@ def parse_ecobank(pages_words, pages_text, _pdf_path=''):
             if not label or any(s in label_up for s in SKIP_UP) or re.match(r'^[\d\s/\-]+$', label):
                 i += 1; continue
             memo_parts = []
+            txn_type_suffix = ''   # COMM / TAX / PRIN récupéré depuis les lignes de continuation
             j = i + 1
             while j < len(rows):
                 r2 = rows[j]
                 if _eco_date(r2): break
                 cont = ' '.join(w['text'] for w in r2 if 90 <= w['x0'] < 350).strip()
                 if cont and not any(s in cont.upper() for s in SKIP_UP):
-                    memo_parts.append(cont)
+                    # La dernière ligne de continuation Ecobank est souvent COMM / TAX / PRIN
+                    if re.match(r'^(COMM|TAX|PRIN)$', cont.upper()):
+                        txn_type_suffix = cont.upper()
+                    else:
+                        memo_parts.append(cont)
                 j += 1
             i = j
 
-            # ── Colonnes montants ────────────────────────────────────────────
-            # Format français :  Débit x0≈390–465 / Crédit x0≈465–535
-            # Format anglais  :  Payments x0≈420–510 / Deposits x0≈510–590
-            # On essaie les deux fenêtres et on garde la plus large
-            if date_info[0] == 'en':
-                debit_words  = [w for w in row if 420 <= w['x0'] < 510]
-                credit_words = [w for w in row if 510 <= w['x0'] < 595]
-            else:
-                debit_words  = [w for w in row if 390 <= w['x0'] < 465]
-                credit_words = [w for w in row if 465 <= w['x0'] < 535]
+            # Enrichir le label avec le type d'opération Ecobank
+            if txn_type_suffix:
+                _type_labels = {'COMM': 'Commission', 'TAX': 'Taxe', 'PRIN': 'Principal'}
+                label = label + ' — ' + _type_labels.get(txn_type_suffix, txn_type_suffix)
 
-            # Montants en format anglais : "XOF6,500.00" → parse_amount gère déjà
+            # ── Colonnes montants ────────────────────────────────────────────
             def _eco_parse_en(words):
+                """Parse un montant XOF anglais : 'XOF6,500.00' → 6500.0"""
                 full = ' '.join(w['text'] for w in words).strip()
-                # Retirer le préfixe devise "XOF"
                 full = re.sub(r'^XOF', '', full, flags=re.IGNORECASE).strip()
-                # Format "6,500.00" → remplacer virgule-milliers, point-décimal
                 full = full.replace(',', '')
                 try:
                     v = float(full)
@@ -3957,12 +4090,85 @@ def parse_ecobank(pages_words, pages_text, _pdf_path=''):
                     return None
 
             if date_info[0] == 'en':
-                debit_amt  = _eco_parse_en(debit_words)
-                credit_amt = _eco_parse_en(credit_words)
+                # ── Format anglais Ecobank ──────────────────────────────────
+                # Colonnes exactes (mesurées sur le PDF) :
+                #   Payments  x0 ≈ 357  (<410) → DÉBIT
+                #   Deposits  x0 ≈ 417  (≥410, <476) → CRÉDIT
+                #   Balance   x0 ≈ 476  (≥476) → solde, à exclure
+                #
+                # Cas spécial : paire d'écritures B/O annulée
+                #   Ligne 1 : tiret "-" dans Payments + solde → écriture d'annulation
+                #   Ligne 2 : montant XOF dans Payments → écriture complémentaire
+                #   Ces deux lignes se compensent (net = 0) → à ignorer toutes les deux.
+                #
+                # Tokens fusionnés (ex. "XOF3,000,000.00XOF8,224,583.00") :
+                #   → 1er montant = opération, 2ème = solde
+
+                def _eco_split_xof(text):
+                    """Renvoie (montant_op, solde_opt) depuis un token XOF éventuellement fusionné."""
+                    hits = re.findall(r'XOF([\d,]+\.?\d*)', text, re.IGNORECASE)
+                    if not hits:
+                        return None, None
+                    vals = [float(h.replace(',', '')) for h in hits]
+                    return (vals[0], vals[1]) if len(vals) >= 2 else (vals[0], None)
+
+                # Détecter ligne d'annulation : tiret "-" dans zone Payments, aucun XOF op
+                dash_in_pay = any(
+                    w['text'] == '-' and 330 <= w['x0'] < 476 for w in row
+                )
+
+                xof_tokens = sorted(
+                    [w for w in row if 'XOF' in w['text'] and w['x0'] >= 335],
+                    key=lambda w: w['x0']
+                )
+                op_amt    = None
+                cur_solde = None
+                col_x0    = 0
+
+                for w in xof_tokens:
+                    v1, v2 = _eco_split_xof(w['text'])
+                    if v2 is not None:          # token fusionné
+                        op_amt    = v1
+                        cur_solde = v2
+                        col_x0    = w['x0']
+                    elif w['x0'] >= 476:        # colonne Balance
+                        cur_solde = v1
+                    else:
+                        if v1 and v1 > 0:
+                            op_amt = v1
+                            col_x0 = w['x0']
+
+                if cur_solde is not None:
+                    _eco_prev_solde = cur_solde
+
+                # Ligne d'annulation (tiret) → ignorer + marquer la suivante
+                if dash_in_pay and op_amt is None:
+                    _eco_skip_next_bo = True
+                    continue
+
+                # Ligne complémentaire d'une paire annulée → ignorer
+                if _eco_skip_next_bo and 'B/O' in label.upper():
+                    _eco_skip_next_bo = False
+                    continue
+                _eco_skip_next_bo = False
+
+                date_ofx = _eco_date_ofx(date_info)
+                name, memo = smart_label(label, memo_parts)
+
+                if op_amt and op_amt > 0:
+                    if col_x0 >= 410:
+                        txns.append(_make_txn(date_ofx, op_amt, name, memo))   # CRÉDIT
+                    else:
+                        txns.append(_make_txn(date_ofx, -op_amt, name, memo))  # DÉBIT
+
+                continue  # passer le bloc format français ci-dessous
+
             else:
+                # ── Format français Ecobank ─────────────────────────────────
+                debit_words  = [w for w in row if 390 <= w['x0'] < 465]
+                credit_words = [w for w in row if 465 <= w['x0'] < 535]
                 debit_amt  = _uba_join_amount(debit_words)
                 credit_amt = _uba_join_amount(credit_words)
-                # Montant négatif dans colonne débit = remboursement (crédit)
                 if debit_amt is None:
                     raw_d = ' '.join(w['text'] for w in debit_words)
                     if '- ' in raw_d or raw_d.strip().startswith('-'):
@@ -3970,12 +4176,12 @@ def parse_ecobank(pages_words, pages_text, _pdf_path=''):
                         try: credit_amt = float(nums); debit_amt = None
                         except: pass
 
-            date_ofx = _eco_date_ofx(date_info)
-            name, memo = smart_label(label, memo_parts)
-            if debit_amt and debit_amt > 0:
-                txns.append(_make_txn(date_ofx, -debit_amt, name, memo))
-            elif credit_amt and credit_amt > 0:
-                txns.append(_make_txn(date_ofx, credit_amt, name, memo))
+                date_ofx = _eco_date_ofx(date_info)
+                name, memo = smart_label(label, memo_parts)
+                if debit_amt and debit_amt > 0:
+                    txns.append(_make_txn(date_ofx, -debit_amt, name, memo))
+                elif credit_amt and credit_amt > 0:
+                    txns.append(_make_txn(date_ofx, credit_amt, name, memo))
 
     # Fallback universel si rien extrait
     if not txns and _pdf_path and Path(_pdf_path).exists():
