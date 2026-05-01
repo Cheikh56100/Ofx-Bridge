@@ -2251,15 +2251,20 @@ def parse_bis(pages_words, pages_text, _pdf_path=''):
             if any(s in label for s in SKIP):
                 continue
 
-            # Crédit (Mnt Cr) : x0 ≈ 320-415  |  Débit (Mnt débit) : x0 ≈ 415-500
-            credit_words = [w for w in row if 320 <= w['x0'] < 415]
-            debit_words  = [w for w in row if 415 <= w['x0'] < 500]
+            # Positions mesurées sur PDF BIS réel (ECOLE BILINGUE AVENI, mai 2024) :
+            #   En-tête "Mnt. de Cr"    x0=319 → montants crédit à x0 ≈ 344–400
+            #   En-tête "Mnt. de débit" x0=397 → montants débit  à x0 ≈ 427–470
+            #   Solde (fusionné "XXXXX Crédit") x0 ≈ 509 → à ignorer strictement
+            # Note : le '0' fictif (colonne vide) est à x0=375 (crédit) ou x0=459 (débit)
+            credit_words = [w for w in row if 320 <= w['x0'] < 410]
+            debit_words  = [w for w in row if 415 <= w['x0'] < 490]
 
             credit_raw = ' '.join(w['text'] for w in credit_words).strip()
             debit_raw  = ' '.join(w['text'] for w in debit_words).strip()
 
-            credit_amt = _uba_join_amount(credit_words) if credit_raw and credit_raw != '0' else None
-            debit_amt  = _uba_join_amount(debit_words)  if debit_raw  and debit_raw  != '0' else None
+            # '0' seul = colonne vide dans ce format BIS — ne pas le traiter comme un montant
+            credit_amt = _uba_join_amount(credit_words) if credit_raw and credit_raw not in ('0', '') else None
+            debit_amt  = _uba_join_amount(debit_words)  if debit_raw  and debit_raw  not in ('0', '') else None
 
             date_ofx = date_full_to_ofx(date_str)
             name, memo = smart_label(label, [])
@@ -5082,9 +5087,23 @@ def main():
         st.divider()
 
         st.markdown("""
-        <div style="font-size:0.78rem; color:rgba(255,255,255,0.45); line-height:1.7;">
-          <div style="font-weight:700; color:rgba(255,255,255,0.6); margin-bottom:5px; font-size:0.72rem; text-transform:uppercase; letter-spacing:0.08em;">Détection automatique</div>
-          Qonto · LCL · Crédit Agricole · Caisse d'Épargne · Banque Populaire · CIC · La Banque Postale · Société Générale · BNP Paribas · CGD · myPOS · Shine · CBAO · Ecobank · BCI · Coris · UBA · Orabank · BOA · ATB · BSIC · BIS · BNDE · + Format universel
+        <div style="font-size:0.78rem; color:rgba(255,255,255,0.55); line-height:1.8;">
+          <div style="font-weight:700; color:rgba(255,255,255,0.7); margin-bottom:8px; font-size:0.72rem; text-transform:uppercase; letter-spacing:0.08em;">&#127968; Détection automatique</div>
+          <div style="display:flex; gap:10px;">
+            <div style="flex:1; border:1px solid rgba(255,255,255,0.15); border-radius:8px; padding:8px 10px; background:rgba(255,255,255,0.04);">
+              <div style="font-weight:700; color:#7dd3fc; font-size:0.70rem; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:5px;">&#127467;&#127479; Banques France</div>
+              <div style="color:rgba(255,255,255,0.55); font-size:0.74rem; line-height:2.0;">
+                Qonto<br>LCL<br>Crédit Agricole<br>Caisse d'Épargne<br>Banque Populaire<br>CGD (Caixa)<br>Société Générale<br>La Banque Postale<br>CIC<br>myPOS<br>Shine
+              </div>
+            </div>
+            <div style="flex:1; border:1px solid rgba(255,255,255,0.15); border-radius:8px; padding:8px 10px; background:rgba(255,255,255,0.04);">
+              <div style="font-weight:700; color:#34d399; font-size:0.70rem; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:5px;">&#127758; Banques Afrique</div>
+              <div style="color:rgba(255,255,255,0.55); font-size:0.74rem; line-height:2.0;">
+                Ecobank<br>SG Sénégal<br>UBA<br>BNDE<br>Banque Islamique SN<br>BSIC<br>Bank of Africa<br>NSIA Banque<br>Orabank<br>CBAO<br>Coris Bank
+              </div>
+            </div>
+          </div>
+          <div style="margin-top:7px; font-size:0.70rem; color:rgba(255,255,255,0.30);">+ Format universel pour toute autre banque</div>
         </div>
         """, unsafe_allow_html=True)
 
