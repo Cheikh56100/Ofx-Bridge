@@ -141,6 +141,22 @@ def group_words_by_row(words, tol=3.0):
 def clean_label(s):
     return re.sub(r'\s+', ' ', s).strip()
 
+def join_words_with_spaces(words, gap_threshold=4.0):
+    """
+    Reconstruit un libellé depuis une liste de mots pdfplumber en insérant
+    un espace entre deux mots dès que l'écart horizontal (x0_suivant - x1_précédent)
+    dépasse gap_threshold points. Cela corrige le problème où pdfplumber
+    fusionne des tokens contigus sans espace (ex: SAROUXELAUBER → SA ROUXEL AUBER).
+    """
+    if not words:
+        return ''
+    parts = [words[0]['text']]
+    for prev, cur in zip(words, words[1:]):
+        gap = cur['x0'] - prev['x1']
+        sep = ' ' if gap >= gap_threshold else ''
+        parts.append(sep + cur['text'])
+    return ''.join(parts)
+
 def _is_technical_label(label):
     if not label:
         return True
@@ -538,12 +554,14 @@ def parse_qonto(pages_words, pages_text):
             date_str = _qonto_date(row)
             if not date_str:
                 i += 1; continue
-            label = ' '.join(w['text'] for w in row if 130 <= w['x0'] < 410).strip()
+            label_words = [w for w in row if 130 <= w['x0'] < 410]
+            label = join_words_with_spaces(label_words)
             amount = _qonto_amount(row)
             memo = ''
             j = i + 1
             while j < len(rows) and not _qonto_date(rows[j]):
-                nl = ' '.join(w['text'] for w in rows[j] if 130 <= w['x0'] < 410).strip()
+                memo_words = [w for w in rows[j] if 130 <= w['x0'] < 410]
+                nl = join_words_with_spaces(memo_words)
                 na = _qonto_amount(rows[j])
                 if na is not None and amount is None:
                     amount = na; memo = nl; j += 1; break
