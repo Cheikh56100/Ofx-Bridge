@@ -3960,8 +3960,124 @@ def parse_coris(pages_words, pages_text, _pdf_path=''):
 
     # Fallback universel si rien trouvé
     if not txns and _pdf_path and Path(_pdf_path).exists():
-        return _universal_parse_path(_pdf_path, pages_text)
+        # Essayer d'abord le parseur universel
+        info2, txns2 = _universal_parse_path(_pdf_path, pages_text)
+        if txns2:
+            return info2, txns2
+        # Si toujours rien, utiliser Claude Vision (tableau dans image)
+        try:
+            info3, txns3 = _coris_vision_fallback(_pdf_path, info)
+            if txns3:
+                return info3, txns3
+        except Exception as exc:
+            logger.warning("Coris Vision fallback échoué : %s", exc)
     return info, [t for t in txns if t is not None]
+
+
+def _coris_vision_fallback(pdf_path, info):
+    """
+    Fallback pour les relevés Coris Bank dont les données (dates, montants)
+    sont intégrées dans une image. Envoie chaque page à l'API Claude Vision
+    et parse la réponse JSON structurée.
+    Requiert ANTHROPIC_API_KEY dans l'environnement et PyMuPDF ou pdf2image.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY absent — fallback vision impossible")
+
+    # Convertir les pages PDF en images PNG
+    images_b64 = _pdf_to_images_base64(pdf_path)
+    if not images_b64:
+        raise RuntimeError("Impossible de convertir le PDF en images")
+
+    PROMPT_TEXT = (
+        "Tu es un extracteur de relevé bancaire Coris Bank Sénégal. "
+        "Ce relevé a les colonnes : Date | Libellé | Valeur | Débit | Crédit | Solde. "
+        "Les montants sont en FCFA entiers (ex: 2 064 000, 65 000 000). "
+        "Extrais TOUTES les lignes de transaction du tableau. "
+        "Réponds UNIQUEMENT avec un JSON valide sans texte autour, format strict :\n"
+        '{"transactions": ['
+        '{"date": "DD/MM/YYYY", "libelle": "...", "debit": 0, "credit": 0}'
+        ', ...]}\n'
+        "Règles :\n"
+        "- date : utilise la colonne Date (pas Valeur)\n"
+        "- libelle : texte complet (concatène les lignes de suite si besoin)\n"
+        "- debit / credit : montant numérique pur (entier, sans espaces ni virgule)\n"
+        "- Ignore : 'Solde précédent', 'Report', 'Nombre de transactions', 'Total des mouvements', 'Solde au'\n"
+        "- Les lignes FRAIS PACKAGE, VRT PERMANENT AUTRE BANQUE sont des vraies transactions à inclure"
+    )
+
+    txns = []
+    for img_b64 in images_b64:
+        payload = {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 4096,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+                    {"type": "text", "text": PROMPT_TEXT}
+                ]
+            }]
+        }
+        try:
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=json.dumps(payload).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                data = json.loads(resp.read())
+        except Exception as exc:
+            logger.warning("Coris Vision API call failed: %s", exc)
+            continue
+
+        raw_text = ''.join(b.get('text', '') for b in data.get('content', []) if b.get('type') == 'text').strip()
+
+        # Nettoyer les éventuels marqueurs de code
+        if raw_text.startswith('```'):
+            raw_text = re.sub(r'^```[a-z]*\n?', '', raw_text)
+            raw_text = re.sub(r'\n?```$', '', raw_text.strip())
+        try:
+            parsed = json.loads(raw_text)
+        except json.JSONDecodeError:
+            m = re.search(r'\{.*\}', raw_text, re.DOTALL)
+            if not m:
+                logger.warning("Coris Vision: réponse non-JSON : %s", raw_text[:200])
+                continue
+            try:
+                parsed = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                continue
+
+        for t in parsed.get('transactions', []):
+            date_str = str(t.get('date', '')).strip()
+            label    = str(t.get('libelle', '')).strip()
+            debit    = float(t.get('debit', 0) or 0)
+            credit   = float(t.get('credit', 0) or 0)
+
+            if not date_str or not label:
+                continue
+            date_ofx = date_full_to_ofx(date_str)
+            if not re.match(r'^\d{8}$', date_ofx):
+                continue
+
+            if debit > 0:
+                txn = _make_txn(date_ofx, -debit, label)
+                if txn:
+                    txns.append(txn)
+            elif credit > 0:
+                txn = _make_txn(date_ofx, credit, label)
+                if txn:
+                    txns.append(txn)
+
+    return info, txns
+
 
 def parse_ecobank(pages_words, pages_text, _pdf_path=''):
     """
