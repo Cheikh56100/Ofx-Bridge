@@ -3609,29 +3609,44 @@ def parse_nsia(pages_words, pages_text, _pdf_path=''):
             # Détails Transaction : x0 ≈ 80–380 (élargi pour capturer descriptions longues)
             # Le libellé NSIA est souvent sur PLUSIEURS lignes précédant la ligne de date.
             # La date est sur une ligne qui contient aussi le n° agence et les montants.
-            label_words = [w for w in row if 80 <= w['x0'] < 380
+            # Format IROKO/NSIA : la ligne de date contient "OPID: xxx TERM: xxx" comme
+            # continuation du libellé, tandis que "VIREMENT. SV CLEARING :-PURCHASE"
+            # se trouve sur la ligne précédente (sans date).
+            # On exclut les tokens purement numériques longs (n° chèque ≥ 9 chiffres)
+            # ainsi que les n° agence courts (2-3 chiffres à x0 ≈ 280-320).
+            label_words = [w for w in row if 80 <= w['x0'] < 245
                            and not re.match(r'^\d{2}/\d{2}/\d{4}$', w['text'])
-                           and not re.match(r'^\d{2,3}$', w['text'])]  # exclure n° agence (2-3 chiffres)
-            label = ' '.join(w['text'] for w in label_words).strip()
+                           and not re.match(r'^\d{9,}$', w['text'])    # exclure n° chèque long
+                           and not re.match(r'^\d{2,4}$', w['text'])]  # exclure n° agence (2-4 chiffres)
+            label_same = ' '.join(w['text'] for w in label_words).strip()
 
-            # Si libellé vide ou trop court sur la ligne de date, chercher dans les lignes précédentes
-            if (not label or len(label) < 3) and i > 0:
-                # Chercher jusqu'à 5 lignes en arrière
-                parts = []
-                for k in range(i - 1, max(i - 6, -1), -1):
+            # Toujours chercher dans les lignes précédentes (jusqu'à 4 lignes en arrière)
+            # même si le label courant n'est pas vide, car le type de transaction
+            # (SV CLEARING :PURCHASE vs :-PURCHASE) est souvent sur la ligne précédente.
+            parts_prev = []
+            if i > 0:
+                for k in range(i - 1, max(i - 5, -1), -1):
                     prev_row = rows[k]
-                    prev_date = [w for w in prev_row if w['x0'] < 80
+                    prev_date = [w for w in prev_row if w['x0'] < 82
                                  and re.match(r'^\d{2}/\d{2}/\d{4}$', w['text'])]
                     if prev_date:
                         break  # autre transaction → stop
-                    prev_label_words = [w for w in prev_row if 80 <= w['x0'] < 380
+                    prev_label_words = [w for w in prev_row if 80 <= w['x0'] < 300
                                         and not re.match(r'^\d{2}/\d{2}/\d{4}$', w['text'])
-                                        and not re.match(r'^\d{2,3}$', w['text'])]
+                                        and not re.match(r'^\d{9,}$', w['text'])
+                                        and not re.match(r'^\d{2,4}$', w['text'])]
                     pl = ' '.join(w['text'] for w in prev_label_words).strip()
                     if pl and not any(s in pl.upper() for s in SKIP):
-                        parts.insert(0, pl)
-                if parts:
-                    label = ' '.join(parts)
+                        parts_prev.insert(0, pl)
+
+            # Construire le label complet : lignes précédentes + ligne courante
+            label = ' '.join(parts_prev + ([label_same] if label_same else '')).strip()
+            # Fallback : si toujours vide, prendre tout le texte de la ligne courante (zone élargie)
+            if not label or len(label) < 3:
+                label_words_wide = [w for w in row if 80 <= w['x0'] < 380
+                                    and not re.match(r'^\d{2}/\d{2}/\d{4}$', w['text'])
+                                    and not re.match(r'^\d{2,3}$', w['text'])]
+                label = ' '.join(w['text'] for w in label_words_wide).strip()
 
             label_up = label.upper()
             if not label or len(label) < 3:
@@ -3641,22 +3656,17 @@ def parse_nsia(pages_words, pages_text, _pdf_path=''):
             if label_up in SKIP:
                 i += 1; continue
 
-            # Mouv. Débit : x0 ≈ 380–450
-            # Mouv. Crédit : x0 ≈ 450–525
-            # Solde : x0 ≥ 525 (ignorer absolument)
-            # Stratégie : regrouper tous les mots numériques en blocs, puis
-            # affecter selon la position x0 de chaque bloc.
+            # Mouv. Débit  : x0 ≈ 390–460  (tokens numériques dans cette zone)
+            # Mouv. Crédit : x0 ≈ 460–515  (tokens numériques dans cette zone)
+            # Solde        : x0 ≥ 515 → exclure absolument pour éviter toute confusion
             # IMPORTANT : ne pas filtrer les tokens à 3 chiffres comme '000' car
-            # ils font partie des montants (ex: '750' + '000' = 750 000)
+            # ils font partie des montants (ex: '17' + '500' = 17 500)
             right_words = sorted(
-                [w for w in row if w['x0'] >= 380
+                [w for w in row if 380 <= w['x0'] < 515
                  and re.search(r'^\d+$', w['text'])  # uniquement les tokens purement numériques
                  and not re.match(r'^\d{2}/\d{2}/\d{4}$', w['text'])],
                 key=lambda w: w['x0']
             )
-            # Exclure le numéro d'agence (3-4 chiffres, x0 < 340) uniquement dans la zone libellé
-            # Les agences NSIA ont un numéro court (ex: 311, 301, 307) à x0 ≈ 285-300
-            # Ils sont déjà exclus car on commence à x0 >= 380
 
             # Regrouper en blocs contigus (gap > 18px = nouveau bloc)
             nsia_blocs, cur_b, prev_x1_b = [], [], None
@@ -3677,15 +3687,16 @@ def parse_nsia(pages_words, pages_text, _pdf_path=''):
                 if v is not None and v > 0:
                     nsia_resolved.append((v, x0_b))
 
-            # Positions mesurées sur relevé NSIA IROKO BEACH (mars 2026) :
-            #   Débit  : en-tête "Mouv. Débit"  x0=394 → tokens à x0 ≈ 411–437
-            #   Crédit : en-tête "Mouv. Crédit" x0=463 → tokens à x0 ≈ 463–515
-            #   Solde  : x0 ≥ 520 → ignorer strictement
+            # Positions mesurées sur relevé NSIA IROKO BEACH (avril 2026) :
+            #   En-tête : "Mouv. Débit" x0=394, "Mouv. Crédit" x0=463, "Solde" x0=541
+            #   Tokens débit  : x0 ≈ 419–437  (ex: '1','250' → '1 250')
+            #   Tokens crédit : x0 ≈ 484–510  (ex: '17','500' → '17 500')
+            #   Tokens solde  : x0 ≈ 524–548  → ignorer strictement
             NSIA_DEBIT_MIN   = 390
-            NSIA_DEBIT_MAX   = 445
-            NSIA_CREDIT_MIN  = 458
+            NSIA_DEBIT_MAX   = 460
+            NSIA_CREDIT_MIN  = 460
             NSIA_CREDIT_MAX  = 520
-            NSIA_SOLDE_MIN   = 520   # ignorer tout ce qui est ≥ 520
+            NSIA_SOLDE_MIN   = 515   # ignorer tout ce qui est ≥ 515
 
             debit_amt  = None
             credit_amt = None
@@ -3742,11 +3753,14 @@ def parse_nsia(pages_words, pages_text, _pdf_path=''):
             #   :-PURCHASE OPID=xxxx → montant principal            → GARDER (crédit)
             # La distinction est uniquement dans le libellé : ":-PURCHASE" vs ":PURCHASE"
             # NE PAS filtrer sur le montant car cela cause des erreurs.
+            # Enrichir avec les lignes de mémo pour capturer le type quand il est
+            # sur la ligne APRÈS la date (ex: ligne 51=VIREMENT, 52=DATE, 53=CLEARING).
+            full_context_up = (label_up + ' ' + ' '.join(memo_parts)).upper()
             is_tpe_frais = False
-            if 'SV CLEARING' in label_up or 'CLEARING' in label_up:
-                is_minus_purchase = (':-PURCHASE' in label_up
-                                     or bool(re.search(r':-\s*PURCHASE', label_up)))
-                if not is_minus_purchase and ':PURCHASE' in label_up:
+            if 'SV CLEARING' in full_context_up or 'CLEARING' in full_context_up:
+                is_minus_purchase = (':-PURCHASE' in full_context_up
+                                     or bool(re.search(r':-\s*PURCHASE', full_context_up)))
+                if not is_minus_purchase and ':PURCHASE' in full_context_up:
                     # Frais réseau TPE → ignorer
                     is_tpe_frais = True
 
@@ -3761,12 +3775,12 @@ def parse_nsia(pages_words, pages_text, _pdf_path=''):
                 # prendre le premier bloc non-solde et utiliser les mots-clés
                 if non_solde:
                     amt = non_solde[0][0]
-                    is_credit = any(k in label_up for k in CREDIT_KW)
-                    is_debit  = any(k in label_up for k in DEBIT_KW)
+                    is_credit = any(k in full_context_up for k in CREDIT_KW)
+                    is_debit  = any(k in full_context_up for k in DEBIT_KW)
                     # SV CLEARING :-PURCHASE = entrée (crédit)
-                    if ':-PURCHASE' in label_up or '-PURCHASE' in label_up:
+                    if ':-PURCHASE' in full_context_up or '-PURCHASE' in full_context_up:
                         txns.append(_make_txn(date_ofx, amt, name, memo))
-                    elif ':PURCHASE' in label_up and ':-PURCHASE' not in label_up:
+                    elif ':PURCHASE' in full_context_up and ':-PURCHASE' not in full_context_up:
                         # Ignorer si montant < 5000 (frais/commissions)
                         if amt >= 5000:
                             txns.append(_make_txn(date_ofx, -amt, name, memo))
@@ -3779,11 +3793,11 @@ def parse_nsia(pages_words, pages_text, _pdf_path=''):
                     # Prendre le premier uniquement et déduire via sémantique
                     if nsia_resolved:
                         amt = nsia_resolved[0][0]
-                        is_credit = any(k in label_up for k in CREDIT_KW)
-                        is_debit  = any(k in label_up for k in DEBIT_KW)
-                        if ':-PURCHASE' in label_up or '-PURCHASE' in label_up:
+                        is_credit = any(k in full_context_up for k in CREDIT_KW)
+                        is_debit  = any(k in full_context_up for k in DEBIT_KW)
+                        if ':-PURCHASE' in full_context_up or '-PURCHASE' in full_context_up:
                             txns.append(_make_txn(date_ofx, amt, name, memo))
-                        elif ':PURCHASE' in label_up and ':-PURCHASE' not in label_up:
+                        elif ':PURCHASE' in full_context_up and ':-PURCHASE' not in full_context_up:
                             if amt >= 5000:
                                 txns.append(_make_txn(date_ofx, -amt, name, memo))
                         elif is_credit and not is_debit:
