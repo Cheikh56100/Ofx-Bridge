@@ -878,28 +878,67 @@ def parse_cic(pages_words, pages_text):
     txns = []
     for pw in pages_words:
         rows = group_words_by_row(pw)
+        # Détecter dynamiquement les limites des colonnes débit/crédit sur cette page
+        # En analysant la ligne "Total des mouvements" ou les colonnes d'en-tête
+        # Par défaut : débit ~420-490, crédit ~490+
+        # On ajuste dynamiquement selon le x0 des montants trouvés dans les lignes de transaction
         i = 0
         while i < len(rows):
             row = rows[i]
             date_str = _cic_date(row)
             if not date_str:
                 i += 1; continue
-            label = ' '.join(w['text'] for w in row if 140 <= w['x0'] < 430).strip()
-            debit_amt  = _parse_col_amount([w for w in row if 420 <= w['x0'] < 500])
-            credit_amt = _parse_col_amount([w for w in row if w['x0'] >= 500])
-            memo = ''
+
+            # Le libellé commence après les deux colonnes de date (x0 ≈ 100-145)
+            # et s'étend jusqu'à la zone montant
+            # On détecte dynamiquement le x_label_start (après la 2e date)
+            date_words = [w for w in row if re.match(r'^\d{2}/\d{2}/\d{4}$', w['text'])]
+            x_label_start = max((w['x1'] for w in date_words), default=140) + 2
+            # Zone montant : tous les mots numériques en fin de ligne (x0 > 400)
+            amount_words = [w for w in row if w['x0'] > 400 and re.match(r'^[\d.,]+$', w['text'])]
+            # Libellé = mots entre fin des dates et début des montants
+            x_label_end = min((w['x0'] for w in amount_words), default=420) - 2
+            label_words = [w for w in row if x_label_start <= w['x0'] < x_label_end]
+            label = ' '.join(w['text'] for w in label_words).strip()
+
+            # Détermination débit / crédit selon la position du montant dans la ligne
+            # Sur ce relevé CIC : débit ≈ col 420-490, crédit ≈ col 490+
+            # On utilise le fait que débit est AVANT crédit (x0 plus petit)
+            debit_amt = None
+            credit_amt = None
+            if len(amount_words) >= 2:
+                # Deux montants : le plus à gauche = débit, le plus à droite = crédit
+                sorted_amts = sorted(amount_words, key=lambda w: w['x0'])
+                debit_amt  = _parse_col_amount([sorted_amts[0]])
+                credit_amt = _parse_col_amount([sorted_amts[-1]])
+            elif len(amount_words) == 1:
+                # Un seul montant : débit si x0 < milieu (~490), crédit sinon
+                w = amount_words[0]
+                # Trouver x_mid dynamiquement : milieu entre x_label_end et bord droit
+                # Par défaut on utilise 490 comme seuil
+                if w['x0'] < 490:
+                    debit_amt = _parse_col_amount([w])
+                else:
+                    credit_amt = _parse_col_amount([w])
+
+            # Lignes de continuation (mémo) : pas de date, dans la zone libellé
+            memo_parts = []
             j = i + 1
             while j < len(rows) and not _cic_date(rows[j]):
-                nl = ' '.join(w['text'] for w in rows[j] if 140 <= w['x0'] < 430).strip()
-                if nl and len(nl) > 2 and not re.match(r'^[\d.,]+$', nl):
-                    memo = (memo + ' ' + nl).strip()
+                nl_words = [w for w in rows[j] if x_label_start <= w['x0'] < x_label_end + 100]
+                nl = ' '.join(w['text'] for w in nl_words).strip()
+                if nl and len(nl) > 2 and not re.match(r'^[\d.,\s]+$', nl):
+                    memo_parts.append(nl)
                 j += 1
             i = j
+
             if not label: continue
-            skip_kw = {'DATE','DÉBIT','CRÉDIT','EUROS','SOLDE CREDITEUR','CREDIT INDUSTRIEL','TOTAL DES MOUVEMENTS'}
+            skip_kw = {'DATE','DÉBIT','CRÉDIT','EUROS','SOLDE CREDITEUR','CREDIT INDUSTRIEL',
+                       'TOTAL DES MOUVEMENTS','TOTAL DES','SOLDE DEBITEUR'}
             if any(s in label.upper() for s in skip_kw): continue
+
             date_ofx = date_full_to_ofx(date_str)
-            name, memo_out = smart_label(label, [memo] if memo else [])
+            name, memo_out = smart_label(label, memo_parts)
             if debit_amt is not None:
                 txns.append(_make_txn(date_ofx, -debit_amt, name, memo_out))
             elif credit_amt is not None:
@@ -907,8 +946,9 @@ def parse_cic(pages_words, pages_text):
     return info, [t for t in txns if t is not None]
 
 def _cic_date(row):
+    """Retourne la première date JJ/MM/AAAA trouvée dans les 150 premiers points de la ligne."""
     for w in row:
-        if w['x0'] < 100 and re.match(r'^\d{2}/\d{2}/\d{4}$', w['text']):
+        if w['x0'] < 150 and re.match(r'^\d{2}/\d{2}/\d{4}$', w['text']):
             return w['text']
     return ''
 
