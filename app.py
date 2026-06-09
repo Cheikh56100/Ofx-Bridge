@@ -56,6 +56,15 @@ import base64
 import json
 import urllib.request
 
+# ── Export Excel (journal comptable format BQ) ────────────────────────────────
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    _OPENPYXL_OK = True
+except ImportError:
+    _OPENPYXL_OK = False
+
 # ════════════════════════════════════════════════════════════════════════════
 # MODÈLE PYDANTIC
 # ════════════════════════════════════════════════════════════════════════════
@@ -4876,6 +4885,103 @@ def fmt_amount(amount: float, currency: str) -> str:
         return f"{abs(amount):,.0f} {currency}".replace(",", "\u202f")
 
 
+def generate_excel_journal(txns_for_ofx, sheet_name="Journal BQ"):
+    """
+    Génère un fichier Excel au format journal comptable BQ (double écriture 471000/512000)
+    identique au format macon_pro_journal.
+    Retourne les bytes du fichier .xlsx.
+    """
+    if not _OPENPYXL_OK:
+        return None
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = sheet_name[:31]  # Excel limite à 31 caractères
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+    header_fill = PatternFill("solid", start_color="1F4E79", end_color="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+    row_fill_even = PatternFill("solid", start_color="DCE6F1", end_color="DCE6F1")
+    row_fill_odd  = PatternFill("solid", start_color="FFFFFF", end_color="FFFFFF")
+    total_fill = PatternFill("solid", start_color="BDD7EE", end_color="BDD7EE")
+    total_font = Font(bold=True, name="Arial", size=10)
+    thin_border = Border(
+        left=Side(style='thin', color='BFBFBF'),
+        right=Side(style='thin', color='BFBFBF'),
+        top=Side(style='thin', color='BFBFBF'),
+        bottom=Side(style='thin', color='BFBFBF'),
+    )
+    data_font = Font(name="Arial", size=10)
+
+    # ── En-têtes ──────────────────────────────────────────────────────────────
+    headers = ["CODE JOURNAL", "DATE", "COMPTE", "INTITULE", "PIECE1", "PIECE2", "DEBIT", "CREDIT"]
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.border = thin_border
+    ws.row_dimensions[1].height = 18
+
+    # ── Données (double écriture) ─────────────────────────────────────────────
+    row = 2
+    for t in txns_for_ofx:
+        d = t['date']  # AAAAMMJJ
+        date_fmt = f"{d[6:8]}/{d[4:6]}/{d[0:4]}"
+        label = (t.get('name') or '')[:80]
+        is_debit = t['type'] == 'DEBIT'
+        amount = abs(t['amount'])
+
+        for compte, debit_val, credit_val in [
+            (471000, amount if is_debit else None, amount if not is_debit else None),
+            (512000, amount if not is_debit else None, amount if is_debit else None),
+        ]:
+            ws.cell(row=row, column=1, value="BQ")
+            ws.cell(row=row, column=2, value=date_fmt)
+            ws.cell(row=row, column=3, value=compte)
+            ws.cell(row=row, column=4, value=label)
+            ws.cell(row=row, column=5, value="")
+            ws.cell(row=row, column=6, value="")
+            if debit_val:
+                ws.cell(row=row, column=7, value=debit_val)
+                ws.cell(row=row, column=7).number_format = '#,##0.00'
+            if credit_val:
+                ws.cell(row=row, column=8, value=credit_val)
+                ws.cell(row=row, column=8).number_format = '#,##0.00'
+
+            fill = row_fill_even if (row % 2 == 0) else row_fill_odd
+            for col in range(1, 9):
+                ws.cell(row=row, column=col).fill = fill
+                ws.cell(row=row, column=col).font = data_font
+                ws.cell(row=row, column=col).border = thin_border
+                ws.cell(row=row, column=col).alignment = Alignment(vertical='center')
+            row += 1
+
+    # ── Ligne totaux ──────────────────────────────────────────────────────────
+    ws.cell(row=row, column=4, value="TOTAL")
+    ws.cell(row=row, column=7, value=f"=SUM(G2:G{row-1})")
+    ws.cell(row=row, column=8, value=f"=SUM(H2:H{row-1})")
+    for col in range(1, 9):
+        ws.cell(row=row, column=col).fill = total_fill
+        ws.cell(row=row, column=col).font = total_font
+        ws.cell(row=row, column=col).border = thin_border
+        ws.cell(row=row, column=col).alignment = Alignment(horizontal='center', vertical='center')
+    ws.cell(row=row, column=4).alignment = Alignment(horizontal='left', vertical='center')
+    for col in [7, 8]:
+        ws.cell(row=row, column=col).number_format = '#,##0.00'
+
+    # ── Largeurs colonnes ─────────────────────────────────────────────────────
+    for i, w in enumerate([14, 12, 10, 55, 10, 10, 13, 13], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    ws.freeze_panes = "A2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 def main():
     st.set_page_config(
         page_title="OFX Bridge — PDF vers OFX",
@@ -5748,13 +5854,57 @@ def main():
             </div>
             """, unsafe_allow_html=True)
 
+        # ── Téléchargement Excel (journal comptable BQ) ────────────────────────
+        if _OPENPYXL_OK:
+            st.markdown('<div class="section-header" style="margin-top:0.8rem">📊 Télécharger le journal comptable Excel</div>', unsafe_allow_html=True)
+
+            # Détermination du nom de l'onglet (mois + année si dispo)
+            period_end = info.get('period_end', '') or ''
+            if re.match(r'\d{8}', period_end):
+                mois_num  = period_end[4:6]
+                annee     = period_end[0:4]
+                mois_noms = {'01':'Janvier','02':'Février','03':'Mars','04':'Avril',
+                             '05':'Mai','06':'Juin','07':'Juillet','08':'Août',
+                             '09':'Septembre','10':'Octobre','11':'Novembre','12':'Décembre'}
+                sheet_label = f"{mois_noms.get(mois_num, mois_num)} {annee}"
+            else:
+                sheet_label = Path(uploaded_file.name).stem[:31]
+
+            xlsx_bytes = generate_excel_journal(txns_for_ofx, sheet_name=sheet_label)
+            xlsx_name  = Path(uploaded_file.name).stem + "_journal_BQ.xlsx"
+
+            col_xl1, col_xl2 = st.columns([2, 3])
+            with col_xl1:
+                st.download_button(
+                    label=f"📥  Télécharger {xlsx_name}",
+                    data=xlsx_bytes,
+                    file_name=xlsx_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_xlsx_{file_key}",
+                    use_container_width=True,
+                )
+            with col_xl2:
+                st.markdown(f"""
+                <div style="padding:0.6rem 0; font-size:0.83rem; color:#7489b0; line-height:1.7;">
+                  <b style="color:#0f2d6b">Format :</b> Journal comptable BQ (double écriture)
+                  &nbsp;&nbsp;·&nbsp;&nbsp;
+                  <b style="color:#0f2d6b">Comptes :</b> 471000 / 512000
+                  &nbsp;&nbsp;·&nbsp;&nbsp;
+                  <b style="color:#0f2d6b">{len(txns_for_ofx) * 2} lignes</b>
+                  &nbsp;&nbsp;·&nbsp;&nbsp;
+                  {'<span style="color:#d97706;font-weight:600">✏️ Données corrigées</span>' if has_changes else 'Onglet : ' + sheet_label}
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("ℹ️ Installez `openpyxl` pour activer l'export Excel : `pip install openpyxl`")
+
         st.markdown('</div>', unsafe_allow_html=True)  # .result-card
 
     # ── Footer ────────────────────────────────────────────────────────────────
     st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
     st.markdown("""
     <div class="footer-bar">
-      <span>💱 <span class="highlight">OFX Bridge</span> v2.4</span>
+      <span>💱 <span class="highlight">OFX Bridge</span> v2.5</span>
       <span>🔒 Traitement 100 % local — Aucune donnée envoyée vers un serveur externe</span>
       <span>✉️ Compatible Quadra · MyUnisoft · Sage · EBP</span>
     </div>
