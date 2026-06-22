@@ -544,6 +544,10 @@ def detect_bank(pages_text):
         return 'BNDE'
     if ('DÉBIT (XOF)' in text or 'DEBIT (XOF)' in text) and ('CRÉDIT (XOF)' in text or 'CREDIT (XOF)' in text) and 'EXTRAIT DE COMPTE' in text:
         return 'BNDE'
+    # Détection Wise (Wise Europe SA — néo-banque internationale)
+    if ('WISE' in text or 'TRWIBEB' in text or 'WISE EUROPE' in text
+            or 'WISE.COM' in text):
+        return 'WISE'
     return 'UNIVERSAL'
 
 
@@ -4395,6 +4399,181 @@ def parse_ecobank(pages_words, pages_text, _pdf_path=''):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# PARSEUR WISE (Wise Europe SA — relevés EUR)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _extract_wise_header(pages_text):
+    """Extrait les métadonnées d'un relevé Wise (IBAN BE, période, solde)."""
+    text = pages_text[0]
+    info = {
+        'iban': '',
+        'period_start': '',
+        'period_end': '',
+        'balance_open': 0.0,
+        'balance_close': 0.0,
+    }
+
+    # IBAN
+    info['iban'] = extract_iban(text)
+
+    # Période : "1 mai 2026 [GMT+02:00] - 31 mai 2026 [GMT+02:00]"
+    # ou       "3 avril 2026 [GMT+02:00] - 2 mai 2026 [GMT+02:00]"
+    MONTHS_FR = {
+        'janvier':1,'février':2,'mars':3,'avril':4,'mai':5,'juin':6,
+        'juillet':7,'août':8,'septembre':9,'octobre':10,'novembre':11,'décembre':12,
+    }
+    m = re.search(
+        r'(\d{1,2})\s+([a-zéûô]+)\s+(\d{4}).*?-\s*(\d{1,2})\s+([a-zéûô]+)\s+(\d{4})',
+        text, re.IGNORECASE
+    )
+    if m:
+        def _ofx_date(d, mo_str, y):
+            mo = MONTHS_FR.get(mo_str.lower(), 1)
+            return f"{y}{mo:02d}{int(d):02d}"
+        info['period_start'] = _ofx_date(m.group(1), m.group(2), m.group(3))
+        info['period_end']   = _ofx_date(m.group(4), m.group(5), m.group(6))
+
+    # Solde de clôture : "EUR du 31 mai 2026 [GMT+02:00]  240,98 EUR"
+    mc = re.search(r'EUR\s+du\s+\d{1,2}\s+\w+\s+\d{4}[^\n]*?([\d\s]+,\d{2})\s*EUR', text)
+    if mc:
+        info['balance_close'] = parse_amount(mc.group(1)) or 0.0
+
+    return info
+
+
+def parse_wise(pages_words, pages_text, _pdf_path=None):
+    """
+    Parseur dédié aux relevés Wise (Wise Europe SA — relevés EUR).
+    Structure texte :
+      Ligne A : "Transaction de carte de XX,XX EUR émise par MARCHAND  [-XX,XX]  solde"
+                "Argent reçu de NWA avec la référence REF  [XX,XX]  solde"
+      Ligne B : "JJ mois AAAA  Carte se terminant par XXXX  ...  Transaction : CARD-XXX"
+      (Parfois une ligne intermédiaire : suite du libellé ex "MASSY")
+    """
+    info = _extract_wise_header(pages_text)
+
+    MONTHS_FR = {
+        'janvier':1,'f\u00e9vrier':2,'mars':3,'avril':4,'mai':5,'juin':6,
+        'juillet':7,'ao\u00fbt':8,'septembre':9,'octobre':10,'novembre':11,'d\u00e9cembre':12,
+        'fevrier':2,'aout':8,
+    }
+
+    def _wise_date_ofx(date_str):
+        """Convertit 'JJ mois AAAA' en AAAAMMJJ."""
+        m = re.match(r'(\d{1,2})\s+([a-z\u00e9\u00fb\u00f4]+)\s+(\d{4})', date_str.strip(), re.IGNORECASE)
+        if m:
+            mo = MONTHS_FR.get(m.group(2).lower(), 1)
+            return f"{m.group(3)}{mo:02d}{int(m.group(1)):02d}"
+        return ''
+
+    # Pattern : montant signé en fin de ligne de description
+    # Ex: "-4,80 240,98"  → sortant 4.80
+    #     "100,00 289,60" → entrant 100.00
+    #     "-150,00 139,60"→ sortant 150.00
+    pat_amounts = re.compile(r'(?<!\d)(-?\d{1,7},\d{2})\s+(\d{1,10},\d{2})\s*$')
+    
+    # Ligne de détail (date + carte/virement)
+    pat_detail = re.compile(r'^(\d{1,2}\s+[a-z\u00e9\u00fb\u00f4]+\s+\d{4})\b', re.IGNORECASE)
+
+    txns = []
+    full_text = '\n'.join(pages_text)
+    lines = [l.strip() for l in full_text.split('\n') if l.strip()]
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Cherche un montant signé ou positif en fin de ligne
+        ma = pat_amounts.search(line)
+        if not ma:
+            i += 1
+            continue
+
+        # Vérifier qu'une ligne de date suit (éventuellement après une ligne de suite libellé)
+        # Chercher la date parmi les 3 prochaines lignes
+        date_ofx = ''
+        detail_idx = -1
+        desc_continuation = ''
+
+        for offset in range(1, 4):
+            if i + offset >= len(lines):
+                break
+            candidate = lines[i + offset]
+            md = pat_detail.match(candidate)
+            if md:
+                date_ofx = _wise_date_ofx(md.group(1))
+                detail_idx = i + offset
+                # Si offset == 2, la ligne i+1 est une continuation du libellé
+                if offset == 2:
+                    desc_continuation = lines[i + 1]
+                break
+            # Si la ligne intermédiaire ressemble à une continuation (ville, suite marchand)
+            # on continue à chercher, sinon on abandonne
+            if re.match(r'^[A-Z][A-Z0-9\s\-\.]+$', candidate) or len(candidate) < 30:
+                continue  # continuation probable
+            else:
+                break  # ce n'est pas une txn Wise
+
+        if not date_ofx or detail_idx < 0:
+            i += 1
+            continue
+
+        # Extraire le montant (colonne 1 = flux, colonne 2 = solde)
+        col1_str = ma.group(1).strip()
+        amount_val = parse_amount(col1_str)
+        if amount_val is None:
+            i = detail_idx + 1
+            continue
+
+        # Si col1 commence par "-" → sortant (débit)
+        if col1_str.startswith('-'):
+            amount = -abs(amount_val)
+        else:
+            # Montant positif → entrant ou remboursement
+            amount = abs(amount_val)
+
+        # Construire le libellé : retirer les montants en fin de ligne
+        desc = pat_amounts.sub('', line).strip()
+        if desc_continuation:
+            desc = desc + ' ' + desc_continuation
+
+        # Extraire le nom du marchand/émetteur
+        mc = re.match(r'transaction\s+de\s+carte\s+de\s+[\d,\s]+EUR\s+[e\u00e9]mise\s+par\s+(.+)', desc, re.IGNORECASE)
+        mt = re.match(r'argent\s+re[\u00e7c]u\s+de\s+(.+?)\s+avec\s+la\s+r[e\u00e9]f[e\u00e9]rence\s+(.+)', desc, re.IGNORECASE)
+
+        if mc:
+            label = mc.group(1).strip()
+        elif mt:
+            label = f"Virement reçu de {mt.group(1).strip()}"
+        else:
+            label = desc
+
+        # Mémo depuis la ligne de détail
+        detail_line = lines[detail_idx]
+        memo_parts = []
+        ref_m = re.search(r'Transaction\s*:\s*(\S+)', detail_line, re.IGNORECASE)
+        if ref_m:
+            memo_parts.append(ref_m.group(1))
+        ref_m2 = re.search(r'R[e\u00e9]f[e\u00e9]rence\s*:\s*(\S+)', detail_line, re.IGNORECASE)
+        if ref_m2:
+            memo_parts.append(ref_m2.group(1))
+        memo_str = ' | '.join(memo_parts)
+
+        if date_ofx and label:
+            txns.append(_make_txn(date_ofx, amount, label[:64], memo_str[:128]))
+
+        i = detail_idx + 1
+
+    # Fallback universel si rien extrait
+    if not txns and _pdf_path and Path(_pdf_path).exists():
+        _, txns2 = _universal_parse_path(_pdf_path, pages_text)
+        if txns2:
+            return info, txns2
+
+    return info, [t for t in txns if t is not None]
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # DEVISE & LABELS
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -4403,7 +4582,7 @@ BANK_CURRENCY = {
     'CM':'EUR','CGD':'EUR','LBP':'EUR','SG':'EUR','BNP':'EUR','MYPOS':'EUR','SHINE':'EUR',
     'CBAO':'XOF','ECOBANK':'XOF','BCI':'XOF','CORIS':'XOF','UBA':'XOF',
     'ORABANK':'XOF','BOA':'XOF','ATB':'TND','SG_AFRIQUE':'XOF','BSIC':'XOF',
-    'BIS':'XOF','BNDE':'XOF','UNIVERSAL':'XOF','NSIA':'XOF',
+    'BIS':'XOF','BNDE':'XOF','UNIVERSAL':'XOF','NSIA':'XOF','WISE':'EUR',
 }
 
 BANK_LABELS = {
@@ -4417,7 +4596,7 @@ BANK_LABELS = {
     'ORABANK':'Orabank','BOA':'Bank of Africa','ATB':'Arab Tunisian Bank',
     'SG_AFRIQUE':'Société Générale Afrique','BSIC':'BSIC (Sénégal)',
     'BIS':'Banque Islamique du Sénégal','BNDE':'BNDE','UNIVERSAL':'Format universel',
-    'NSIA':'NSIA Banque',
+    'NSIA':'NSIA Banque','WISE':'Wise (néo-banque internationale)',
 }
 
 AFRICAN_BANKS = {'CBAO','ECOBANK','BCI','CORIS','UBA','ORABANK','BOA','ATB',
@@ -4430,7 +4609,7 @@ PARSERS = {
     'CBAO':parse_cbao,'ECOBANK':parse_ecobank,'BCI':parse_bci,'CORIS':parse_coris,
     'UBA':parse_uba,'ORABANK':parse_orabank,'BOA':parse_boa,'ATB':parse_atb,
     'SG_AFRIQUE':parse_sg_afrique,'UNIVERSAL':parse_universal,
-    'BSIC':parse_bsic,'BIS':parse_bis,'BNDE':parse_bnde,'NSIA':parse_nsia,
+    'BSIC':parse_bsic,'BIS':parse_bis,'BNDE':parse_bnde,'NSIA':parse_nsia,'WISE':parse_wise,
 }
 
 
